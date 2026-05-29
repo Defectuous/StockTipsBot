@@ -1,0 +1,21 @@
+# Google OAuth secrets — never commit these
+credentials.json
+token.json
+client_secret_220416644191-hh6oiqck8keq0np23q9p28sdt8dce9cb.apps.googleusercontent.com.json
+
+# Environment config
+.env
+
+# Bot runtime files
+stockbot.db
+stockbot.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+dist/
+build/

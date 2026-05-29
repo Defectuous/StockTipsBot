@@ -1,0 +1,129 @@
+import sqlite3
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List
+
+logger = logging.getLogger(__name__)
+
+DB_PATH = Path(__file__).parent.parent / "stockbot.db"
+
+
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with _connect() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS processed_emails (
+                message_id  TEXT PRIMARY KEY,
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS positions (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol                  TEXT NOT NULL,
+                provider                TEXT NOT NULL,
+                shares                  INTEGER NOT NULL,
+                buy_price               REAL NOT NULL,
+                buy_time                TIMESTAMP NOT NULL,
+                buy_order_id            TEXT,
+                trailing_stop_order_id  TEXT,
+                status                  TEXT DEFAULT 'open',
+                sell_price              REAL,
+                sell_time               TIMESTAMP,
+                pnl                     REAL,
+                created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS price_bars (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol    TEXT NOT NULL,
+                timestamp TIMESTAMP NOT NULL,
+                open      REAL NOT NULL,
+                high      REAL NOT NULL,
+                low       REAL NOT NULL,
+                close     REAL NOT NULL,
+                volume    INTEGER NOT NULL,
+                UNIQUE(symbol, timestamp)
+            );
+        """)
+    logger.info("Database ready: %s", DB_PATH)
+
+
+def is_email_processed(message_id: str) -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM processed_emails WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        return row is not None
+
+
+def mark_email_processed(message_id: str):
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO processed_emails (message_id) VALUES (?)", (message_id,)
+        )
+
+
+def save_position(
+    symbol: str,
+    provider: str,
+    shares: int,
+    buy_price: float,
+    buy_time: datetime,
+    buy_order_id: str,
+) -> int:
+    with _connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO positions (symbol, provider, shares, buy_price, buy_time, buy_order_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (symbol, provider, shares, buy_price, buy_time.isoformat(), buy_order_id),
+        )
+        return cur.lastrowid
+
+
+def update_trailing_stop_order(position_id: int, order_id: str):
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE positions SET trailing_stop_order_id = ? WHERE id = ?",
+            (order_id, position_id),
+        )
+
+
+def close_position(position_id: int, sell_price: float, sell_time: datetime, pnl: float):
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE positions
+               SET status = 'closed', sell_price = ?, sell_time = ?, pnl = ?
+               WHERE id = ?""",
+            (sell_price, sell_time.isoformat(), pnl, position_id),
+        )
+
+
+def get_open_positions() -> List[sqlite3.Row]:
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM positions WHERE status = 'open'"
+        ).fetchall()
+
+
+def save_price_bar(
+    symbol: str,
+    timestamp: datetime,
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    volume: int,
+):
+    with _connect() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO price_bars
+               (symbol, timestamp, open, high, low, close, volume)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (symbol, timestamp.isoformat(), open_, high, low, close, volume),
+        )
