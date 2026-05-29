@@ -73,7 +73,7 @@ def get_stock_data(symbol: str, api_key: str, api_secret: str) -> Optional[Dict]
     # Use latest bar if available; fall back to last historical bar
     bar = latest_bar or bars[-1]
 
-    closes = [b.c for b in bars]
+    closes = [b.close for b in bars]
     rsi = _rsi(closes) if len(closes) >= 15 else None
 
     momentum = None
@@ -82,12 +82,12 @@ def get_stock_data(symbol: str, api_key: str, api_secret: str) -> Optional[Dict]
 
     return {
         "symbol":   symbol,
-        "price":    bar.c,
-        "open":     bar.o,
-        "high":     bar.h,
-        "low":      bar.l,
-        "close":    bar.c,
-        "volume":   bar.v,
+        "price":    bar.close,
+        "open":     bar.open,
+        "high":     bar.high,
+        "low":      bar.low,
+        "close":    bar.close,
+        "volume":   bar.volume,
         "rsi":      rsi,
         "momentum": momentum,
         "bars":     bars,
