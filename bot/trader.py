@@ -87,9 +87,16 @@ class Trader:
     ) -> Optional[Order]:
         """
         Place a GTC trailing-stop SELL order.
-        *trail_percent*: distance from the high-water mark (e.g. 50 = 50 %).
+        *trail_percent*: distance from the high-water mark. Alpaca caps this at 25%.
         The order stays active across sessions until filled or manually cancelled.
         """
+        # Alpaca hard limit
+        if trail_percent > 25:
+            logger.warning(
+                "trail_percent %.0f%% exceeds Alpaca's 25%% maximum — capping at 25%%",
+                trail_percent,
+            )
+            trail_percent = 25.0
         try:
             order = self.client.submit_order(
                 TrailingStopOrderRequest(
