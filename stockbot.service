@@ -6,9 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 # Change User and WorkingDirectory to match your Pi setup
-User=pi
-WorkingDirectory=/home/pi/StockTipsBot
-ExecStart=/home/pi/StockTipsBot/venv/bin/python main.py
+User=defectuous
+WorkingDirectory=/home/defectuous/StockTipsBot
+ExecStart=/home/defectuous/StockTipsBot/.venv/bin/python main.py
 Restart=on-failure
 RestartSec=30
 StandardOutput=journal

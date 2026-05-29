@@ -43,7 +43,7 @@ class Trader:
             order = self.client.submit_order(
                 MarketOrderRequest(
                     symbol=symbol,
-                    qty=shares,
+                    qty=str(shares),
                     side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY,
                 )
@@ -94,7 +94,7 @@ class Trader:
             order = self.client.submit_order(
                 TrailingStopOrderRequest(
                     symbol=symbol,
-                    qty=qty,
+                    qty=str(qty),
                     side=OrderSide.SELL,
                     time_in_force=TimeInForce.GTC,
                     trail_percent=trail_percent,
