@@ -62,16 +62,20 @@ trader: Trader
 # ── Email processing ──────────────────────────────────────────────────────────
 def process_emails():
     emails = gmail.get_new_voice_emails(max_age_seconds=EMAIL_MAX_AGE)
+    logger.info("Gmail poll: %d new Voice email(s) found", len(emails))
+
     for email in emails:
         msg_id = email["id"]
         if is_email_processed(msg_id):
+            logger.info("Skipping duplicate email %s", msg_id)
             continue
 
         provider, ticker = parse_email(email["body"])
         mark_email_processed(msg_id)
 
         if not ticker:
-            logger.debug("Email %s: no ticker found", msg_id)
+            logger.info("Email %s: no ticker pattern matched — body preview: %.80s",
+                        msg_id, email["body"].replace("\n", " "))
             continue
 
         logger.info("Alert  provider=%s  ticker=%s", provider, ticker)
