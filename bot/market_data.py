@@ -53,7 +53,9 @@ def get_stock_data(symbol: str, api_key: str, api_secret: str) -> Optional[Dict]
             end=end,
         )
         resp = client.get_stock_bars(req)
-        bars = list(resp.get(symbol, []))
+        bars = list(resp[symbol])
+    except KeyError:
+        logger.warning("No historical bars returned for %s", symbol)
     except Exception as e:
         logger.warning("Bars unavailable for %s: %s", symbol, e)
 
@@ -62,7 +64,9 @@ def get_stock_data(symbol: str, api_key: str, api_secret: str) -> Optional[Dict]
     try:
         req = StockLatestBarRequest(symbol_or_symbols=symbol)
         resp = client.get_stock_latest_bar(req)
-        latest_bar = resp.get(symbol)
+        latest_bar = resp[symbol]
+    except KeyError:
+        logger.warning("No latest bar returned for %s", symbol)
     except Exception as e:
         logger.warning("Latest bar unavailable for %s: %s", symbol, e)
 
@@ -87,7 +91,7 @@ def get_stock_data(symbol: str, api_key: str, api_secret: str) -> Optional[Dict]
         "high":     bar.high,
         "low":      bar.low,
         "close":    bar.close,
-        "volume":   bar.volume,
+        "volume":   int(bar.volume),
         "rsi":      rsi,
         "momentum": momentum,
         "bars":     bars,
