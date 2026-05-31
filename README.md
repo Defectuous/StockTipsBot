@@ -79,6 +79,16 @@ New providers can be added by appending a regex tuple to `bot/email_parser.py`.
 ```bash
 git clone https://github.com/Defectuous/StockTipsBot.git
 cd StockTipsBot
+
+# Create virtual environment
+python -m venv .venv
+
+# Activate (Windows PowerShell)
+.venv\Scripts\Activate.ps1
+
+# Activate (Linux/macOS)
+source .venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
