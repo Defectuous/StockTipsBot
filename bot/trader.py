@@ -116,6 +116,31 @@ class Trader:
             logger.error("Trailing stop failed for %s: %s", symbol, e)
             return None
 
+    def cancel_order(self, order_id: str) -> bool:
+        try:
+            self.client.cancel_order_by_id(order_id)
+            logger.info("Cancelled order %s", order_id)
+            return True
+        except Exception as e:
+            logger.error("Cancel failed for %s: %s", order_id, e)
+            return False
+
+    def market_sell(self, symbol: str, qty: int) -> Optional[Order]:
+        try:
+            order = self.client.submit_order(
+                MarketOrderRequest(
+                    symbol=symbol,
+                    qty=str(qty),
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                )
+            )
+            logger.info("Market sell submitted: %s x%d  id=%s", symbol, qty, order.id)
+            return order
+        except Exception as e:
+            logger.error("Market sell failed for %s: %s", symbol, e)
+            return None
+
     def get_order_status(self, order_id: str) -> Optional[str]:
         try:
             return self.client.get_order_by_id(order_id).status.value

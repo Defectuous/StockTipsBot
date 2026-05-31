@@ -61,6 +61,7 @@ def send_close(
     shares: int,
     pnl: float,
     paper: bool = True,
+    reason: str = "Trailing Stop triggered",
 ):
     mode_tag = "[PAPER] " if paper else ""
     gain = sell_price / buy_price
@@ -75,7 +76,7 @@ def send_close(
             {"name": "P&L",        "value": f"${pnl:+.2f}",                   "inline": True},
             {"name": "Return",     "value": f"{gain:.2f}x",                    "inline": True},
         ],
-        "footer": {"text": "StockTipsBot | Trailing Stop triggered"},
+        "footer": {"text": f"StockTipsBot | {reason}"},
     }
     _post(webhook_url, {"embeds": [embed]})
 

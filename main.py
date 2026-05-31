@@ -9,7 +9,9 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dt_time
+
+import pytz
 
 from dotenv import load_dotenv
 
@@ -56,6 +58,11 @@ EMAIL_MAX_AGE   = int(os.getenv("EMAIL_MAX_AGE_SECONDS", "120"))
 TICKER_COOLDOWN = int(os.getenv("TICKER_COOLDOWN_MINUTES", "30")) * 60
 GMAIL_CREDS     = os.getenv("GMAIL_CREDENTIALS_FILE", "credentials.json")
 GMAIL_TOKEN     = os.getenv("GMAIL_TOKEN_FILE", "token.json")
+
+_ET = pytz.timezone("America/New_York")
+_eod_str = os.getenv("EOD_EXIT_TIME", "15:55")
+_eod_h, _eod_m = _eod_str.split(":")
+EOD_EXIT_TIME = dt_time(int(_eod_h), int(_eod_m))
 
 _stop = threading.Event()
 gmail: GmailReader
@@ -153,9 +160,53 @@ def process_emails():
         )
 
 
+# ── EOD forced exit ───────────────────────────────────────────────────────────
+def _past_eod() -> bool:
+    return datetime.now(_ET).time() >= EOD_EXIT_TIME
+
+
+def _eod_exit(pos):
+    symbol = pos["symbol"]
+    logger.info("EOD exit triggered for %s", symbol)
+
+    if pos["trailing_stop_order_id"]:
+        trader.cancel_order(pos["trailing_stop_order_id"])
+
+    order = trader.market_sell(symbol, pos["shares"])
+    if not order:
+        send_error(DISCORD_WEBHOOK, f"EOD market sell failed for **{symbol}** — manual close required.")
+        return
+
+    filled = trader.wait_for_fill(str(order.id), timeout=60)
+    sell_price = float(filled.filled_avg_price) if filled else pos["buy_price"]
+    pnl = (sell_price - pos["buy_price"]) * pos["shares"]
+
+    close_position(pos["id"], sell_price, datetime.now(timezone.utc), pnl)
+    logger.info("EOD closed %s  buy=%.4f  sell=%.4f  pnl=$%.2f",
+                symbol, pos["buy_price"], sell_price, pnl)
+    send_close(
+        webhook_url=DISCORD_WEBHOOK,
+        symbol=symbol,
+        buy_price=pos["buy_price"],
+        sell_price=sell_price,
+        shares=pos["shares"],
+        pnl=pnl,
+        paper=ALPACA_PAPER,
+        reason="EOD Exit",
+    )
+
+
 # ── Position tracking ─────────────────────────────────────────────────────────
 def track_positions():
     positions = get_open_positions()
+
+    if positions and _past_eod():
+        logger.info("Past EOD exit time (%s ET) — force-closing %d position(s)",
+                    EOD_EXIT_TIME.strftime("%H:%M"), len(positions))
+        for pos in positions:
+            _eod_exit(pos)
+        return
+
     for pos in positions:
         symbol = pos["symbol"]
 
