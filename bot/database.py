@@ -23,6 +23,13 @@ def init_db():
                 processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS ticker_alerts (
+                symbol     TEXT NOT NULL,
+                alerted_at TIMESTAMP NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ticker_alerts_symbol
+                ON ticker_alerts (symbol, alerted_at);
+
             CREATE TABLE IF NOT EXISTS positions (
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol                  TEXT NOT NULL,
@@ -109,6 +116,25 @@ def get_open_positions() -> List[sqlite3.Row]:
         return conn.execute(
             "SELECT * FROM positions WHERE status = 'open'"
         ).fetchall()
+
+
+def is_ticker_on_cooldown(symbol: str, cooldown_seconds: int) -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM ticker_alerts
+               WHERE symbol = ?
+                 AND alerted_at > datetime('now', ? || ' seconds')""",
+            (symbol, f"-{cooldown_seconds}"),
+        ).fetchone()
+        return row is not None
+
+
+def record_ticker_alert(symbol: str):
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO ticker_alerts (symbol, alerted_at) VALUES (?, datetime('now'))",
+            (symbol,),
+        )
 
 
 def save_price_bar(

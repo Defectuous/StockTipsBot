@@ -20,7 +20,9 @@ from bot.database import (
     get_open_positions,
     init_db,
     is_email_processed,
+    is_ticker_on_cooldown,
     mark_email_processed,
+    record_ticker_alert,
     save_position,
     save_price_bar,
     update_trailing_stop_order,
@@ -51,6 +53,7 @@ BUY_AMOUNT      = float(os.getenv("BUY_AMOUNT_USD", "100"))
 TRAIL_PCT       = float(os.getenv("TRAILING_STOP_PERCENT", "50"))
 POLL_INTERVAL   = int(os.getenv("EMAIL_POLL_INTERVAL", "60"))
 EMAIL_MAX_AGE   = int(os.getenv("EMAIL_MAX_AGE_SECONDS", "120"))
+TICKER_COOLDOWN = int(os.getenv("TICKER_COOLDOWN_MINUTES", "30")) * 60
 GMAIL_CREDS     = os.getenv("GMAIL_CREDENTIALS_FILE", "credentials.json")
 GMAIL_TOKEN     = os.getenv("GMAIL_TOKEN_FILE", "token.json")
 
@@ -79,6 +82,15 @@ def process_emails():
             continue
 
         logger.info("Alert  provider=%s  ticker=%s", provider, ticker)
+
+        if is_ticker_on_cooldown(ticker, TICKER_COOLDOWN):
+            logger.info(
+                "Skipping %s — duplicate alert within %d-minute cooldown window",
+                ticker, TICKER_COOLDOWN // 60,
+            )
+            continue
+
+        record_ticker_alert(ticker)
 
         if not trader.is_market_open():
             logger.info("Market closed — skipping buy for %s", ticker)
