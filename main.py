@@ -52,7 +52,7 @@ ALPACA_SECRET   = os.environ["ALPACA_API_SECRET"]
 ALPACA_PAPER    = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 BUY_AMOUNT      = float(os.getenv("BUY_AMOUNT_USD", "100"))
-TRAIL_PCT       = float(os.getenv("TRAILING_STOP_PERCENT", "50"))
+TRAIL_PCT       = float(os.getenv("TRAILING_STOP_PERCENT", "10"))
 POLL_INTERVAL   = int(os.getenv("EMAIL_POLL_INTERVAL", "60"))
 EMAIL_MAX_AGE   = int(os.getenv("EMAIL_MAX_AGE_SECONDS", "120"))
 TICKER_COOLDOWN = int(os.getenv("TICKER_COOLDOWN_MINUTES", "30")) * 60
