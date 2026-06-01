@@ -81,5 +81,18 @@ def send_close(
     _post(webhook_url, {"embeds": [embed]})
 
 
+def send_tip_received(webhook_url: str, symbol: str, provider: str):
+    embed = {
+        "title": f"Tip Received: {symbol}",
+        "color": 0xFFAA00,
+        "fields": [
+            {"name": "Ticker",   "value": symbol,   "inline": True},
+            {"name": "Provider", "value": provider, "inline": True},
+        ],
+        "footer": {"text": "StockTipsBot | Email Alert"},
+    }
+    _post(webhook_url, {"embeds": [embed]})
+
+
 def send_error(webhook_url: str, message: str):
     _post(webhook_url, {"embeds": [{"title": "StockTipsBot Notice", "description": message, "color": _RED}]})

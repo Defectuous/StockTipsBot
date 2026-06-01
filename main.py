@@ -29,7 +29,7 @@ from bot.database import (
     save_price_bar,
     update_trailing_stop_order,
 )
-from bot.discord_notify import send_alert, send_close, send_error
+from bot.discord_notify import send_alert, send_close, send_error, send_tip_received
 from bot.email_parser import parse_email
 from bot.gmail_reader import GmailReader
 from bot.market_data import get_stock_data
@@ -89,6 +89,7 @@ def process_emails():
             continue
 
         logger.info("Alert  provider=%s  ticker=%s", provider, ticker)
+        send_tip_received(DISCORD_WEBHOOK, ticker, provider)
 
         if is_ticker_on_cooldown(ticker, TICKER_COOLDOWN):
             logger.info(
