@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.models import Order
-from alpaca.trading.requests import MarketOrderRequest, TrailingStopOrderRequest
+from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest, TrailingStopOrderRequest
 
 logger = logging.getLogger(__name__)
 
@@ -14,13 +14,6 @@ class Trader:
     def __init__(self, api_key: str, api_secret: str, paper: bool = True):
         self.client = TradingClient(api_key, api_secret, paper=paper)
         self.paper = paper
-
-    def is_market_open(self) -> bool:
-        try:
-            return self.client.get_clock().is_open
-        except Exception as e:
-            logger.error("Clock check failed: %s", e)
-            return False
 
     def buy_stock(
         self,
@@ -39,17 +32,20 @@ class Trader:
                 f"(need at least ${current_price:.4f} for 1 share)"
             )
 
+        limit_price = round(current_price * 1.005, 2)
         try:
             order = self.client.submit_order(
-                MarketOrderRequest(
+                LimitOrderRequest(
                     symbol=symbol,
                     qty=str(shares),
                     side=OrderSide.BUY,
                     time_in_force=TimeInForce.DAY,
+                    limit_price=limit_price,
+                    extended_hours=True,
                 )
             )
             logger.info(
-                "Buy submitted: %s x%d @ ~$%.4f  id=%s", symbol, shares, current_price, order.id
+                "Buy submitted: %s x%d  limit=$%.4f  id=%s", symbol, shares, limit_price, order.id
             )
             return order, None
         except Exception as e:
