@@ -1,12 +1,16 @@
 """
-One-time backfill: populate rsi_at_entry, atr_at_entry, change_pct_at_entry,
-macd_crossover_fresh, and rvol_at_entry for positions that have NULL values.
+Backfill rsi_at_entry, atr_at_entry, change_pct_at_entry, macd_crossover_fresh,
+and rvol_at_entry for positions that have NULL values.
 
 Uses Alpaca historical bar data to reconstruct market state at buy time.
+API keys are resolved from the first available screener account in .env.
 
 Usage:
-    python backfill_entry_stats.py
+    python backfill_entry_stats.py                    # all providers
+    python backfill_entry_stats.py --provider SML     # one provider only
+    python backfill_entry_stats.py --provider MID_SCREENER
 """
+import argparse
 import os
 import sqlite3
 from datetime import datetime, timedelta
@@ -22,9 +26,21 @@ from bot.market_data import _atr, _macd_analysis, _rsi_series
 
 load_dotenv()
 
-ALPACA_KEY    = os.environ["ALPACA_API_KEY"]
-ALPACA_SECRET = os.environ["ALPACA_API_SECRET"]
-DB_PATH       = Path(__file__).parent / "stockbot.db"
+def _resolve_keys() -> tuple[str, str]:
+    """Return the first available Alpaca key pair across all screener accounts."""
+    for prefix in ("SML", "MID", "SUPER", "LIVE"):
+        key    = os.getenv(f"{prefix}_ALPACA_API_KEY")
+        secret = os.getenv(f"{prefix}_ALPACA_API_SECRET")
+        if key and secret:
+            return key, secret
+    key    = os.getenv("ALPACA_API_KEY")
+    secret = os.getenv("ALPACA_API_SECRET")
+    if key and secret:
+        return key, secret
+    raise EnvironmentError("No Alpaca API keys found in .env — set at least one of SML_ALPACA_API_KEY etc.")
+
+ALPACA_KEY, ALPACA_SECRET = _resolve_keys()
+DB_PATH = Path(__file__).parent / "stockbot.db"
 
 _1MIN  = TimeFrame(1,  TimeFrameUnit.Minute)
 _5MIN  = TimeFrame(5,  TimeFrameUnit.Minute)
@@ -140,16 +156,37 @@ def _compute_entry_stats(
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Backfill entry stats for positions.")
+    parser.add_argument(
+        "--provider", "-p",
+        help="Filter by provider name, e.g. SML, MID, SML_SCREENER (default: all)",
+        default=None,
+    )
+    args = parser.parse_args()
+
     client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
     conn   = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
 
-    rows = conn.execute(
-        """SELECT id, symbol, buy_price, buy_time
-           FROM positions
-           WHERE rsi_at_entry IS NULL
-           ORDER BY buy_time"""
-    ).fetchall()
+    if args.provider:
+        # Accept both short form (SML) and full form (SML_SCREENER)
+        provider_filter = args.provider if "_SCREENER" in args.provider else f"{args.provider}_SCREENER"
+        rows = conn.execute(
+            """SELECT id, symbol, buy_price, buy_time
+               FROM positions
+               WHERE rsi_at_entry IS NULL
+                 AND provider = ?
+               ORDER BY buy_time""",
+            (provider_filter,),
+        ).fetchall()
+        print(f"Provider filter: {provider_filter}")
+    else:
+        rows = conn.execute(
+            """SELECT id, symbol, buy_price, buy_time
+               FROM positions
+               WHERE rsi_at_entry IS NULL
+               ORDER BY buy_time"""
+        ).fetchall()
 
     if not rows:
         print("Nothing to backfill — all positions already have entry stats.")
