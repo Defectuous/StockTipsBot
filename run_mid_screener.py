@@ -352,7 +352,7 @@ def scan_and_trade(
 ) -> None:
     now    = datetime.now(pytz.UTC)
     now_et = now.astimezone(pytz.timezone("America/New_York"))
-    ts     = now.strftime("%H:%M:%S")
+    ts     = now_et.strftime("%H:%M:%S")
     hm     = (now_et.hour, now_et.minute)
 
     if START_TIME_ET:
