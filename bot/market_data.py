@@ -10,6 +10,91 @@ from alpaca.data.timeframe import TimeFrame
 logger = logging.getLogger(__name__)
 
 
+def _ema_series(values: List[float], period: int) -> List[Optional[float]]:
+    result: List[Optional[float]] = [None] * len(values)
+    if len(values) < period:
+        return result
+    k = 2.0 / (period + 1)
+    ema = sum(values[:period]) / period
+    result[period - 1] = ema
+    for i in range(period, len(values)):
+        ema = values[i] * k + ema * (1.0 - k)
+        result[i] = ema
+    return result
+
+
+def _rsi_series(closes: List[float], period: int = 14) -> List[Optional[float]]:
+    result: List[Optional[float]] = [None] * len(closes)
+    if len(closes) < period + 1:
+        return result
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains  = [max(d, 0.0) for d in deltas]
+    losses = [abs(min(d, 0.0)) for d in deltas]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    def _to_rsi(ag: float, al: float) -> float:
+        return 100.0 if al == 0 else round(100 - (100 / (1 + ag / al)), 2)
+
+    result[period] = _to_rsi(avg_gain, avg_loss)
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        result[i + 1] = _to_rsi(avg_gain, avg_loss)
+    return result
+
+
+def _macd_analysis(closes: List[float]) -> Optional[dict]:
+    """MACD crossover analysis on the provided close series."""
+    ema12 = _ema_series(closes, 12)
+    ema26 = _ema_series(closes, 26)
+
+    macd_vals: List[float] = [
+        e12 - e26
+        for e12, e26 in zip(ema12, ema26)
+        if e12 is not None and e26 is not None
+    ]
+    if len(macd_vals) < 9:
+        return None
+
+    sig_series = _ema_series(macd_vals, 9)
+    pairs = [(m, s) for m, s in zip(macd_vals, sig_series) if s is not None]
+    if len(pairs) < 3:
+        return None
+
+    macd, signal   = pairs[-1]
+    pm,   ps       = pairs[-2]
+    histogram      = macd - signal
+    prev_histogram = pm - ps
+
+    # Crossover: above signal now, was below within last 10 bars
+    was_below = any(m < s for m, s in pairs[-10:-1])
+    crossover = (macd > signal) and was_below
+    histogram_expanding = histogram > 0 and histogram > prev_histogram
+
+    return {
+        "macd":                round(macd,      4),
+        "signal":              round(signal,    4),
+        "histogram":           round(histogram, 4),
+        "crossover":           crossover,
+        "above_signal":        macd > signal,
+        "histogram_expanding": histogram_expanding,
+    }
+
+
+def _atr(bars: list, period: int = 14) -> Optional[float]:
+    """Average True Range over the last *period* bars."""
+    if len(bars) < period + 1:
+        return None
+    trs = [
+        max(bars[i].high - bars[i].low,
+            abs(bars[i].high - bars[i - 1].close),
+            abs(bars[i].low  - bars[i - 1].close))
+        for i in range(1, len(bars))
+    ]
+    return round(sum(trs[-period:]) / period, 4)
+
+
 def _rsi(closes: List[float], period: int = 14) -> Optional[float]:
     """Wilder's RSI from a list of close prices (oldest first)."""
     if len(closes) < period + 1:

@@ -8,7 +8,16 @@ client_secret_220416644191-hh6oiqck8keq0np23q9p28sdt8dce9cb.apps.googleuserconte
 
 # Bot runtime files
 stockbot.db
+stockbot.test.db
 stockbot.log
+old.token.json
+
+# Generated output
+reports/
+
+# Local tooling
+.claude/
+_experiments/
 
 # Test utilities
 test_*.py

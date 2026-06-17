@@ -11,6 +11,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import pytz
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -53,7 +54,10 @@ BUY_AMOUNT      = float(os.getenv("BUY_AMOUNT_USD", "100"))
 TRAIL_PCT       = float(os.getenv("TRAILING_STOP_PERCENT", "10"))
 POLL_INTERVAL   = int(os.getenv("EMAIL_POLL_INTERVAL", "60"))
 EMAIL_MAX_AGE   = int(os.getenv("EMAIL_MAX_AGE_SECONDS", "120"))
-TICKER_COOLDOWN = int(os.getenv("TICKER_COOLDOWN_MINUTES", "30")) * 60
+TICKER_COOLDOWN  = int(os.getenv("TICKER_COOLDOWN_MINUTES", "30")) * 60
+MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES", "120"))
+DUMP_TIME_ET     = os.getenv("DUMP_TIME_ET", "")            # e.g. "16:30"
+HARD_STOP_PCT    = float(os.getenv("HARD_STOP_PCT",   "0")) # 0 = disabled
 GMAIL_CREDS     = os.getenv("GMAIL_CREDENTIALS_FILE", "credentials.json")
 GMAIL_TOKEN     = os.getenv("GMAIL_TOKEN_FILE", "token.json")
 
@@ -164,6 +168,91 @@ def track_positions():
                 close=data["close"],
                 volume=data["volume"],
             )
+
+        # Hard stop loss
+        if HARD_STOP_PCT > 0 and data:
+            gain_pct = (data["price"] - pos["buy_price"]) / pos["buy_price"] * 100
+            if gain_pct <= -HARD_STOP_PCT:
+                ts_oid = pos["trailing_stop_order_id"]
+                if ts_oid:
+                    trader.cancel_order(ts_oid)
+                sell = trader.market_sell(symbol, pos["shares"])
+                if sell:
+                    filled = trader.wait_for_fill(str(sell.id), timeout=30)
+                    if filled:
+                        fp  = float(filled.filled_avg_price)
+                        pnl = (fp - pos["buy_price"]) * pos["shares"]
+                        close_position(pos["id"], fp, datetime.now(timezone.utc), pnl)
+                        logger.info("Hard stop: %s %.2f%% @ $%.4f  PnL=$%.2f",
+                                    symbol, gain_pct, fp, pnl)
+                        send_close(
+                            webhook_url=DISCORD_WEBHOOK,
+                            symbol=symbol,
+                            buy_price=pos["buy_price"],
+                            sell_price=fp,
+                            shares=pos["shares"],
+                            pnl=pnl,
+                            paper=ALPACA_PAPER,
+                            reason=f"Hard stop -{HARD_STOP_PCT:.0f}%",
+                        )
+                continue
+
+        # Time exit: force-close after MAX_HOLD_MINUTES
+        now_utc  = datetime.now(timezone.utc)
+        buy_dt   = datetime.fromisoformat(pos["buy_time"])
+        held_min = (now_utc - buy_dt).total_seconds() / 60
+        if held_min >= MAX_HOLD_MINUTES:
+            ts_oid = pos["trailing_stop_order_id"]
+            if ts_oid:
+                trader.cancel_order(ts_oid)
+            sell = trader.market_sell(symbol, pos["shares"])
+            if sell:
+                filled = trader.wait_for_fill(str(sell.id), timeout=30)
+                if filled:
+                    fp  = float(filled.filled_avg_price)
+                    pnl = (fp - pos["buy_price"]) * pos["shares"]
+                    close_position(pos["id"], fp, datetime.now(timezone.utc), pnl)
+                    logger.info("Time exit: %s held %.0fm @ $%.4f  PnL=$%.2f",
+                                symbol, held_min, fp, pnl)
+                    send_close(
+                        webhook_url=DISCORD_WEBHOOK,
+                        symbol=symbol,
+                        buy_price=pos["buy_price"],
+                        sell_price=fp,
+                        shares=pos["shares"],
+                        pnl=pnl,
+                        paper=ALPACA_PAPER,
+                        reason="Max hold time exit",
+                    )
+            continue
+
+        # Dump time: force-close at DUMP_TIME_ET
+        if DUMP_TIME_ET:
+            now_et    = now_utc.astimezone(pytz.timezone("America/New_York"))
+            dump_h, dump_m = map(int, DUMP_TIME_ET.split(":"))
+            if (now_et.hour, now_et.minute) >= (dump_h, dump_m):
+                ts_oid = pos["trailing_stop_order_id"]
+                if ts_oid:
+                    trader.cancel_order(ts_oid)
+                sell = trader.market_sell(symbol, pos["shares"])
+                if sell:
+                    filled = trader.wait_for_fill(str(sell.id), timeout=30)
+                    if filled:
+                        fp  = float(filled.filled_avg_price)
+                        pnl = (fp - pos["buy_price"]) * pos["shares"]
+                        close_position(pos["id"], fp, datetime.now(timezone.utc), pnl)
+                        logger.info("Dump time exit: %s @ $%.4f  PnL=$%.2f", symbol, fp, pnl)
+                        send_close(
+                            webhook_url=DISCORD_WEBHOOK,
+                            symbol=symbol,
+                            buy_price=pos["buy_price"],
+                            sell_price=fp,
+                            shares=pos["shares"],
+                            pnl=pnl,
+                            paper=ALPACA_PAPER,
+                            reason=f"Dump time {DUMP_TIME_ET} ET",
+                        )
+                continue
 
         ts_order_id = pos["trailing_stop_order_id"]
         if not ts_order_id:

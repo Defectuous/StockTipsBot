@@ -15,6 +15,12 @@ class Trader:
         self.client = TradingClient(api_key, api_secret, paper=paper)
         self.paper = paper
 
+    def is_market_open(self) -> bool:
+        try:
+            return self.client.get_clock().is_open
+        except Exception:
+            return False
+
     def buy_stock(
         self,
         symbol: str,
@@ -33,6 +39,17 @@ class Trader:
             )
 
         limit_price = round(current_price * 1.005, 2)
+        cost = shares * limit_price
+        try:
+            bp = float(self.client.get_account().buying_power)
+            if bp < cost:
+                return None, (
+                    f"insufficient buying power (have ${bp:.2f}, need ${cost:.2f} "
+                    f"for {shares} × ${limit_price:.2f})"
+                )
+        except Exception as e:
+            logger.warning("Could not verify buying power before buy: %s", e)
+
         try:
             order = self.client.submit_order(
                 LimitOrderRequest(
@@ -135,6 +152,13 @@ class Trader:
             return order
         except Exception as e:
             logger.error("Market sell failed for %s: %s", symbol, e)
+            return None
+
+    def get_cash_balance(self) -> Optional[float]:
+        try:
+            return float(self.client.get_account().cash)
+        except Exception as e:
+            logger.error("Account cash fetch failed: %s", e)
             return None
 
     def get_order_status(self, order_id: str) -> Optional[str]:

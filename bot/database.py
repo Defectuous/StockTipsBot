@@ -39,11 +39,17 @@ def init_db():
                 buy_time                TIMESTAMP NOT NULL,
                 buy_order_id            TEXT,
                 trailing_stop_order_id  TEXT,
+                stop_tightened          INTEGER DEFAULT 0,
                 status                  TEXT DEFAULT 'open',
                 sell_price              REAL,
                 sell_time               TIMESTAMP,
                 pnl                     REAL,
-                created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                rsi_at_entry            REAL,
+                atr_at_entry            REAL,
+                change_pct_at_entry     REAL,
+                macd_crossover_fresh    INTEGER,
+                rvol_at_entry           REAL
             );
 
             CREATE TABLE IF NOT EXISTS price_bars (
@@ -57,7 +63,30 @@ def init_db():
                 volume    INTEGER NOT NULL,
                 UNIQUE(symbol, timestamp)
             );
+
+            CREATE TABLE IF NOT EXISTS wallets (
+                screener_id        TEXT PRIMARY KEY,
+                initial_balance    REAL NOT NULL,
+                current_balance    REAL NOT NULL,
+                day_start_balance  REAL NOT NULL,
+                day_date           TEXT NOT NULL,
+                updated_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
+        # migrations for existing databases
+        _migrations = [
+            ("stop_tightened",        "INTEGER DEFAULT 0"),
+            ("rsi_at_entry",          "REAL"),
+            ("atr_at_entry",          "REAL"),
+            ("change_pct_at_entry",   "REAL"),
+            ("macd_crossover_fresh",  "INTEGER"),
+            ("rvol_at_entry",         "REAL"),
+        ]
+        for col, typedef in _migrations:
+            try:
+                conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {typedef}")
+            except Exception:
+                pass
     logger.info("Database ready: %s", DB_PATH)
 
 
@@ -83,12 +112,23 @@ def save_position(
     buy_price: float,
     buy_time: datetime,
     buy_order_id: str,
+    rsi_at_entry: Optional[float] = None,
+    atr_at_entry: Optional[float] = None,
+    change_pct_at_entry: Optional[float] = None,
+    macd_crossover_fresh: Optional[bool] = None,
+    rvol_at_entry: Optional[float] = None,
 ) -> int:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO positions (symbol, provider, shares, buy_price, buy_time, buy_order_id)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (symbol, provider, shares, buy_price, buy_time.isoformat(), buy_order_id),
+            """INSERT INTO positions
+               (symbol, provider, shares, buy_price, buy_time, buy_order_id,
+                rsi_at_entry, atr_at_entry, change_pct_at_entry,
+                macd_crossover_fresh, rvol_at_entry)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (symbol, provider, shares, buy_price, buy_time.isoformat(), buy_order_id,
+             rsi_at_entry, atr_at_entry, change_pct_at_entry,
+             int(macd_crossover_fresh) if macd_crossover_fresh is not None else None,
+             rvol_at_entry),
         )
         return cur.lastrowid
 
@@ -111,11 +151,74 @@ def close_position(position_id: int, sell_price: float, sell_time: datetime, pnl
         )
 
 
-def get_open_positions() -> List[sqlite3.Row]:
+def mark_stop_tightened(position_id: int, new_stop_order_id: str):
     with _connect() as conn:
+        conn.execute(
+            "UPDATE positions SET stop_tightened = 1, trailing_stop_order_id = ? WHERE id = ?",
+            (new_stop_order_id, position_id),
+        )
+
+
+def get_open_positions(provider: Optional[str] = None) -> List[sqlite3.Row]:
+    with _connect() as conn:
+        if provider:
+            return conn.execute(
+                "SELECT * FROM positions WHERE status = 'open' AND provider = ?",
+                (provider,),
+            ).fetchall()
         return conn.execute(
             "SELECT * FROM positions WHERE status = 'open'"
         ).fetchall()
+
+
+def get_open_position_count(provider: str) -> int:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE status = 'open' AND provider = ?",
+            (provider,),
+        ).fetchone()
+        return row[0] if row else 0
+
+
+def init_wallet(screener_id: str, starting_balance: float) -> None:
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    with _connect() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO wallets
+               (screener_id, initial_balance, current_balance, day_start_balance, day_date)
+               VALUES (?, ?, ?, ?, ?)""",
+            (screener_id, starting_balance, starting_balance, starting_balance, today),
+        )
+
+
+def get_wallet(screener_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM wallets WHERE screener_id = ?", (screener_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def reset_day_wallet(screener_id: str, today_date: str, reconciled_balance: float) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE wallets
+               SET current_balance = ?, day_start_balance = ?, day_date = ?,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE screener_id = ?""",
+            (reconciled_balance, reconciled_balance, today_date, screener_id),
+        )
+
+
+def update_wallet_cash(screener_id: str, delta: float) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE wallets
+               SET current_balance = current_balance + ?,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE screener_id = ?""",
+            (delta, screener_id),
+        )
 
 
 def is_ticker_on_cooldown(symbol: str, cooldown_seconds: int) -> bool:
