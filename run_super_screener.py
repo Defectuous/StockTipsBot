@@ -665,7 +665,7 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             continue
 
         # Stream-based fill wait — no poll loop
-        filled = _wait_for_fill(str(order.id), timeout=60)
+        filled = _wait_for_fill(str(order.id), timeout=180)
         if not filled:
             logger.error("  %s order did not fill within 60s", sym)
             continue
