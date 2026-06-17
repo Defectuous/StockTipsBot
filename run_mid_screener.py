@@ -74,6 +74,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("mid.log"),
+    ],
 )
 logger = logging.getLogger(__name__)
 

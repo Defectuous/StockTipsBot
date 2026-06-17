@@ -10,6 +10,10 @@ client_secret_220416644191-hh6oiqck8keq0np23q9p28sdt8dce9cb.apps.googleuserconte
 stockbot.db
 stockbot.test.db
 stockbot.log
+sml.log
+mid.log
+super.log
+live.log
 old.token.json
 
 # Generated output
