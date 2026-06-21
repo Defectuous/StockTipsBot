@@ -308,8 +308,8 @@ def _start_streams(api_key: str, api_secret: str, paper: bool) -> None:
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(asyncio.gather(
-                _trading_stream._run(),
-                _data_stream._run(),
+                _trading_stream.run(),
+                _data_stream.run(),
             ))
         except Exception as e:
             logger.error("Stream thread error: %s", e, exc_info=True)
