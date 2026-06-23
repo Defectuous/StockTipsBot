@@ -135,7 +135,7 @@ def _maybe_reset_day(trader: Trader, screener_id: str, last_day: list) -> None:
 
     if alpaca_cash is not None:
         logger.info(
-            "Day reset [%s]: DB cash=$%.2f  Alpaca cash=$%.2f  → using Alpaca",
+            "Day reset [%s]: DB cash=$%.2f  Alpaca cash=$%.2f  -> using Alpaca",
             screener_id, db_balance, alpaca_cash,
         )
         reconciled = alpaca_cash
@@ -428,7 +428,7 @@ def scan_and_trade(
             passing.append(result)
 
     logger.info(
-        "[%s] Scanned %d stocks → %d passing MACD+RSI  positions=%d/%d  buy=$%.2f",
+        "[%s] Scanned %d stocks -> %d passing MACD+RSI  positions=%d/%d  buy=$%.2f",
         ts, len(symbols), len(passing), open_count, MAX_POSITIONS, buy_amount,
     )
 
@@ -536,7 +536,7 @@ def main():
     logger.info("LIVE screener starting  [%s]  ($0.50–$5.00)", SCREENER_ID)
     logger.info(
         "Mode: LIVE | MaxPos: %d | Reserve: %.0f%% | Stop: %.0f%% | "
-        "Lock: +%.0f%%→%.0f%% | RSI exit: %.0f",
+        "Lock: +%.0f%%->%.0f%% | RSI exit: %.0f",
         MAX_POSITIONS, RESERVE_PCT, TRAIL_PCT, PROFIT_LOCK_PCT, TIGHT_STOP_PCT, RSI_EXIT_LEVEL,
     )
     logger.info("Cooldown: %ds | Interval: %ds", COOLDOWN_SECS, SCAN_INTERVAL)

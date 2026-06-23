@@ -58,6 +58,8 @@ from alpaca.data import StockHistoricalDataClient
 from alpaca.data.live import StockDataStream
 from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus
+from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.stream import TradingStream
 
 from bot.database import (
@@ -351,7 +353,7 @@ def _maybe_reset_day(trader: Trader, last_day: list) -> None:
     db_balance  = wallet["current_balance"] if wallet else STARTING_BALANCE
 
     if alpaca_cash is not None:
-        logger.info("Day reset: DB=$%.2f  Alpaca=$%.2f → using Alpaca", db_balance, alpaca_cash)
+        logger.info("Day reset: DB=$%.2f  Alpaca=$%.2f -> using Alpaca", db_balance, alpaca_cash)
         reconciled = alpaca_cash
     else:
         logger.warning("Day reset: Alpaca cash unavailable, keeping DB $%.2f", db_balance)
@@ -360,6 +362,84 @@ def _maybe_reset_day(trader: Trader, last_day: list) -> None:
     reset_day_wallet(SCREENER_ID, today_et, reconciled)
     last_day[0] = today_et
     _log_wallet()
+
+
+# ── Orphan position check ─────────────────────────────────────────────────────
+
+def _check_untracked_positions(trader: Trader) -> None:
+    """Detect Alpaca positions not in the DB and auto-register them."""
+    try:
+        alpaca_all = trader.client.get_all_positions()  # type: ignore[union-attr]
+        alpaca_map = {p.symbol: p for p in alpaca_all}  # type: ignore[union-attr]
+    except Exception as e:
+        logger.warning("Orphan check: could not fetch Alpaca positions: %s", e)
+        return
+
+    db_syms = {p["symbol"] for p in get_open_positions(PROVIDER)}
+    orphans = set(alpaca_map) - db_syms
+    if not orphans:
+        return
+
+    logger.warning("UNTRACKED Alpaca positions (not in DB): %s", sorted(orphans))
+
+    for sym in sorted(orphans):
+        ap        = alpaca_map[sym]
+        buy_price = float(ap.avg_entry_price)  # type: ignore[union-attr]
+        shares    = int(float(ap.qty))          # type: ignore[union-attr]
+
+        # Try to find the original filled buy order for this symbol
+        buy_order_id = f"recovered_{sym}_{int(time.time())}"
+        buy_time: datetime = datetime.now(timezone.utc)
+        try:
+            filled = trader.client.get_orders(filter=GetOrdersRequest(  # type: ignore[union-attr]
+                status=QueryOrderStatus.CLOSED, symbols=[sym], limit=20,
+            ))
+            buy_orders = [
+                o for o in filled  # type: ignore[union-attr]
+                if o.side == OrderSide.BUY and o.filled_at is not None
+            ]
+            if buy_orders:
+                buy_orders.sort(key=lambda o: o.filled_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+                bo           = buy_orders[0]
+                buy_order_id = str(bo.id)
+                buy_time     = bo.filled_at or buy_time
+        except Exception as e:
+            logger.warning("Orphan %s: buy order lookup failed (%s) — using placeholder", sym, e)
+
+        # Insert into DB
+        try:
+            pos_id = save_position(sym, PROVIDER, shares, buy_price, buy_time, buy_order_id)
+        except Exception as e:
+            logger.error("Orphan %s: DB insert failed: %s", sym, e)
+            continue
+
+        # Find the open trailing stop order
+        ts_id = None
+        try:
+            open_orders = trader.client.get_orders(filter=GetOrdersRequest(  # type: ignore[union-attr]
+                status=QueryOrderStatus.OPEN, symbols=[sym],
+            ))
+            for o in open_orders:  # type: ignore[union-attr]
+                if o.type == OrderType.TRAILING_STOP:
+                    ts_id = str(o.id)
+                    break
+        except Exception as e:
+            logger.warning("Orphan %s: trailing stop lookup failed: %s", sym, e)
+
+        if ts_id:
+            update_trailing_stop_order(pos_id, ts_id)
+            with _ts_lock:
+                _ts_to_pos[ts_id] = {
+                    "id":        pos_id,
+                    "symbol":    sym,
+                    "buy_price": buy_price,
+                    "shares":    shares,
+                }
+            logger.info("Orphan %s: registered  pos_id=%d  ts=%s", sym, pos_id, ts_id)
+        else:
+            logger.warning("Orphan %s: registered in DB (pos_id=%d) but no trailing stop found — set one manually", sym, pos_id)
+
+        _subscribe_prices([sym])
 
 
 # ── Position monitoring ───────────────────────────────────────────────────────
@@ -486,7 +566,7 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
         # ── 5. Profit lock ────────────────────────────────────────────────────
         if not stop_tightened and gain_pct >= PROFIT_LOCK_PCT:
             logger.info(
-                "  LOCK  %s  +%.1f%% → tightening stop %.0f%% → %.0f%%",
+                "  LOCK  %s  +%.1f%% -> tightening stop %.0f%% -> %.0f%%",
                 sym, gain_pct, TRAIL_PCT, TIGHT_STOP_PCT,
             )
             cancelled = trader.cancel_order(stop_order_id) if stop_order_id else True
@@ -610,7 +690,7 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             passing.append(result)
 
     logger.info(
-        "[%s] Scanned %d stocks ($%.0f–$%.0f) → %d passing MACD+RSI  "
+        "[%s] Scanned %d stocks ($%.0f-$%.0f) -> %d passing MACD+RSI  "
         "pos=%d/%d  buy=$%.2f",
         ts, len(symbols), MIN_PRICE, MAX_PRICE, len(passing),
         open_count, MAX_POSITIONS, buy_amount,
@@ -739,7 +819,7 @@ def main():
     logger.info("SUPER screener starting  [%s]  ($%.0f–$%.0f)", SCREENER_ID, MIN_PRICE, MAX_PRICE)
     logger.info(
         "Mode: %s | MaxPos: %d | Reserve: %.0f%% | Stop: %.0f%% | "
-        "Lock: +%.0f%%→%.0f%% | RSI exit: %.0f",
+        "Lock: +%.0f%%->%.0f%% | RSI exit: %.0f",
         mode, MAX_POSITIONS, RESERVE_PCT, TRAIL_PCT,
         PROFIT_LOCK_PCT, TIGHT_STOP_PCT, RSI_EXIT_LEVEL,
     )
@@ -774,7 +854,7 @@ def main():
         # Re-register trailing stops in memory for TradingStream callbacks
         with _ts_lock:
             for p in existing:
-                ts_id = p.get("trailing_stop_order_id")
+                ts_id = p["trailing_stop_order_id"]
                 if ts_id:
                     _ts_to_pos[ts_id] = {
                         "id":        p["id"],
@@ -812,6 +892,7 @@ def main():
 
             now = time.monotonic()
             if now - last_scan >= SCAN_INTERVAL:
+                _check_untracked_positions(_trader)
                 scan_and_trade(_trader, data_client)
                 last_scan = now
 

@@ -150,7 +150,7 @@ def _maybe_reset_day(
 
     if alpaca_cash is not None:
         logger.info(
-            "Day reset [%s]: DB cash=$%.2f  Alpaca cash=$%.2f  → using Alpaca",
+            "Day reset [%s]: DB cash=$%.2f  Alpaca cash=$%.2f  -> using Alpaca",
             screener_id, db_balance, alpaca_cash,
         )
         reconciled = alpaca_cash
@@ -455,7 +455,7 @@ def scan_and_trade(
             passing.append(result)
 
     logger.info(
-        "[%s] Scanned %d stocks → %d passing MACD+RSI  positions=%d/%d  buy=$%.2f",
+        "[%s] Scanned %d stocks -> %d passing MACD+RSI  positions=%d/%d  buy=$%.2f",
         ts, len(symbols), len(passing), open_count, MAX_POSITIONS, buy_amount,
     )
 
