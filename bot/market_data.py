@@ -1,4 +1,5 @@
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 
@@ -115,6 +116,54 @@ def _rsi(closes: List[float], period: int = 14) -> Optional[float]:
         return 100.0
     rs = avg_gain / avg_loss
     return round(100 - (100 / (1 + rs)), 2)
+
+
+def _vwap(bars: list) -> Optional[float]:
+    """VWAP: Σ(typical_price × volume) / Σ(volume) over the provided bars."""
+    total_pv = 0.0
+    total_vol = 0.0
+    for b in bars:
+        tp = (b.high + b.low + b.close) / 3.0
+        total_pv += tp * b.volume
+        total_vol += b.volume
+    if total_vol == 0:
+        return None
+    return round(total_pv / total_vol, 4)
+
+
+def _rvol_time_adjusted(bars15: list, now_et) -> Optional[float]:
+    """
+    Time-adjusted RVOL: today's cumulative volume from 9:30am ET to now vs
+    the average of the same window on prior trading days in the 15-min bars.
+    """
+    et_tz    = pytz.timezone("America/New_York")
+    open_min = 9 * 60 + 30  # 9:30am in minutes since midnight
+
+    today      = now_et.date()
+    cutoff_min = now_et.hour * 60 + now_et.minute
+
+    by_day: dict = defaultdict(float)
+    for b in bars15:
+        bar_et   = b.timestamp.astimezone(et_tz)
+        bar_date = bar_et.date()
+        bar_min  = bar_et.hour * 60 + bar_et.minute
+        if bar_min < open_min or bar_min > cutoff_min:
+            continue
+        by_day[bar_date] += b.volume
+
+    if today not in by_day:
+        return None
+
+    today_vol  = by_day[today]
+    prior_vols = [v for d, v in by_day.items() if d < today]
+    if not prior_vols:
+        return None
+
+    avg_prior = sum(prior_vols) / len(prior_vols)
+    if avg_prior == 0:
+        return None
+
+    return round(today_vol / avg_prior, 2)
 
 
 def get_stock_data(symbol: str, api_key: str, api_secret: str) -> Optional[Dict]:

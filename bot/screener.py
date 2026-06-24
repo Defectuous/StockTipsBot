@@ -24,7 +24,7 @@ from alpaca.data import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-from bot.market_data import _atr, _macd_analysis, _rsi_series
+from bot.market_data import _atr, _macd_analysis, _rsi_series, _vwap
 from bot.trending import TrendingStock, get_trending
 
 logger = logging.getLogger(__name__)
@@ -32,11 +32,10 @@ logger = logging.getLogger(__name__)
 _5MIN  = TimeFrame(5,  TimeFrameUnit.Minute)
 _15MIN = TimeFrame(15, TimeFrameUnit.Minute)
 
-_5MIN_WINDOW_MINUTES  = 120   # 2 hours → ~24 bars
 _15MIN_WINDOW_DAYS    = 3     # 3 calendar days → ~50 15-min bars (need ≥35 for MACD)
 
 _RSI_MIN     = 50.0   # below this = momentum lost
-_RSI_MAX     = 75.0   # above this = overbought
+_RSI_MAX     = 65.0   # above this = too extended; tightened from 75 to catch earlier entries
 
 
 @dataclass
@@ -50,12 +49,14 @@ class ScreenedStock:
     macd_crossover:      bool
     histogram_expanding: bool
     atr:                 Optional[float]
+    vwap:                Optional[float]
+    above_vwap:          bool
 
     @property
     def passes(self) -> bool:
         rsi_ok   = self.rsi_trending_up and _RSI_MIN <= self.rsi <= _RSI_MAX
         macd_ok  = self.macd_above_signal and self.histogram_expanding
-        return rsi_ok and macd_ok
+        return rsi_ok and macd_ok and self.above_vwap
 
 
 def _analyze(
@@ -80,6 +81,7 @@ def _analyze(
     closes_15m = [b.close for b in bars_15m]
     macd       = _macd_analysis(closes_15m)
     atr_val    = _atr(bars_5m)
+    vwap_val   = _vwap(bars_5m)
 
     return ScreenedStock(
         symbol              = symbol,
@@ -91,6 +93,8 @@ def _analyze(
         macd_crossover      = macd["crossover"]           if macd else False,
         histogram_expanding = macd["histogram_expanding"] if macd else False,
         atr                 = atr_val,
+        vwap                = vwap_val,
+        above_vwap          = (price > vwap_val) if vwap_val is not None else False,
     )
 
 
@@ -104,13 +108,15 @@ def screen_trending(api_key: str, api_secret: str) -> List[ScreenedStock]:
     symbols   = [s.symbol for s in trending]
     price_map = {s.symbol: (s.price, s.change_pct) for s in trending}
     now       = datetime.now(pytz.UTC)
+    now_et    = now.astimezone(pytz.timezone("America/New_York"))
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     client    = StockHistoricalDataClient(api_key, api_secret)
 
     try:
         bars_5m = client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=symbols,
             timeframe=_5MIN,
-            start=now - timedelta(minutes=_5MIN_WINDOW_MINUTES),
+            start=market_open.astimezone(pytz.UTC),
             end=now,
         )).data
     except Exception as e:
