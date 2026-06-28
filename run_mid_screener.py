@@ -64,7 +64,7 @@ from bot.database import (
     update_wallet_cash,
 )
 from bot.discord_notify import send_alert, send_close, send_error
-from bot.market_data import _rsi_series, _rvol_time_adjusted
+from bot.market_data import _rsi_series
 from bot.most_active import get_most_active_penny_stocks
 from bot.screener import _analyze
 from bot.trader import Trader
@@ -105,15 +105,22 @@ HARD_STOP_PCT      = float(os.getenv("HARD_STOP_PCT",        "0"))
 MAX_ENTRY_MOVE_PCT = float(os.getenv("MAX_ENTRY_MOVE_PCT",   "0"))
 MAX_ATR            = float(os.getenv("MAX_ATR",              "0"))
 MAX_RVOL           = float(os.getenv("MAX_RVOL",             "0"))
-MIN_RVOL           = float(os.getenv("MIN_RVOL",             "2.0"))
-MIN_CHANGE_PCT     = float(os.getenv("MIN_CHANGE_PCT",        "2.0"))
 MIN_PRICE       = float(os.getenv("MID_MIN_PRICE",          "2.00"))
 MAX_PRICE       = float(os.getenv("MID_MAX_PRICE",          "20.00"))
+
+_RSI_MIN = 50.0
+_RSI_MAX = 65.0
 
 PROVIDER = f"{SCREENER_ID}_SCREENER"
 
 _5MIN  = TimeFrame(5,  TimeFrameUnit.Minute)
 _15MIN = TimeFrame(15, TimeFrameUnit.Minute)
+
+
+def _passes(result) -> bool:
+    rsi_ok  = result.rsi_trending_up and _RSI_MIN <= result.rsi <= _RSI_MAX
+    macd_ok = result.macd_above_signal and result.histogram_expanding
+    return rsi_ok and macd_ok
 
 
 def _compute_buy_amount(screener_id: str) -> float:
@@ -404,6 +411,7 @@ def scan_and_trade(
     volume_map = {s.symbol: s.volume for s in actives}
 
     # ── 2. Snapshots ──────────────────────────────────────────────────────────
+    prev_vol_map: dict = {}
     try:
         snaps = data_client.get_stock_snapshot(
             StockSnapshotRequest(symbol_or_symbols=symbols)
@@ -414,17 +422,17 @@ def scan_and_trade(
                 prev  = snap.previous_daily_bar.close
                 chg   = round((price - prev) / prev * 100, 2) if prev else 0.0
                 price_map[sym] = (price, chg)
+                if snap.previous_daily_bar.volume:
+                    prev_vol_map[sym] = snap.previous_daily_bar.volume
     except Exception as e:
         logger.warning("Snapshot fetch failed: %s", e)
 
     # ── 3. Bars ───────────────────────────────────────────────────────────────
-    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-
     try:
         bars5 = data_client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=symbols,
             timeframe=_5MIN,
-            start=market_open.astimezone(pytz.UTC),
+            start=now - timedelta(minutes=120),
             end=now,
         )).data
     except Exception as e:
@@ -455,7 +463,7 @@ def scan_and_trade(
             price,
             chg,
         )
-        if result and result.passes:
+        if result and _passes(result):
             passing.append(result)
 
     logger.info(
@@ -493,23 +501,16 @@ def scan_and_trade(
                         sym, stock.atr, MAX_ATR)
             continue
 
-        if MIN_CHANGE_PCT > 0 and (stock.change_pct is None or stock.change_pct < MIN_CHANGE_PCT):
-            logger.info("  SKIP %s — change %.2f%% < %.1f%% min", sym, stock.change_pct or 0.0, MIN_CHANGE_PCT)
+        today_vol = volume_map.get(sym, 0)
+        prev_vol  = prev_vol_map.get(sym)
+        rvol_now  = (today_vol / prev_vol) if prev_vol else None
+        if MAX_RVOL > 0 and rvol_now and rvol_now > MAX_RVOL:
+            logger.info("  SKIP %s — RVOL %.1fx exceeds limit %.0fx",
+                        sym, rvol_now, MAX_RVOL)
             continue
 
-        rvol_ta = _rvol_time_adjusted(list(bars15.get(sym, [])), now_et)
-        if MIN_RVOL > 0 and (rvol_ta is None or rvol_ta < MIN_RVOL):
-            logger.info("  SKIP %s — RVOL %.1fx < %.1fx min", sym, rvol_ta or 0.0, MIN_RVOL)
-            continue
-        if MAX_RVOL > 0 and rvol_ta and rvol_ta > MAX_RVOL:
-            logger.info("  SKIP %s — RVOL %.1fx > %.0fx max", sym, rvol_ta, MAX_RVOL)
-            continue
-
-        logger.info(
-            "  BUY  %s  $%.4f  RSI=%.1f  chg=%+.2f%%  RVOL=%.1fx  VWAP=%s  budget=$%.2f",
-            sym, stock.price, stock.rsi, stock.change_pct, rvol_ta or 0.0,
-            "ok" if stock.above_vwap else "fail", buy_amount,
-        )
+        logger.info("  BUY  %s  $%.4f  RSI=%.1f  chg=%+.2f%%  budget=$%.2f",
+                    sym, stock.price, stock.rsi, stock.change_pct, buy_amount)
 
         order, err = trader.buy_stock(sym, buy_amount, stock.price)
         if err:
@@ -545,7 +546,7 @@ def scan_and_trade(
             atr_at_entry         = stock.atr,
             change_pct_at_entry  = stock.change_pct,
             macd_crossover_fresh = stock.macd_crossover,
-            rvol_at_entry        = round(rvol_ta, 3) if rvol_ta else None,
+            rvol_at_entry        = round(rvol_now, 3) if rvol_now else None,
         )
 
         ts_order = trader.submit_trailing_stop(sym, fill_qty, TRAIL_PCT)

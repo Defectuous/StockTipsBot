@@ -12,6 +12,9 @@ Config (env or .env):
 import os
 import sys
 from datetime import date, datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytz
 from dotenv import load_dotenv
@@ -22,11 +25,18 @@ from bot.sheets import append_trades
 
 load_dotenv()
 
+_ROOT = Path(__file__).resolve().parent.parent
+
+def _resolve(env_var: str, default: str) -> str:
+    val = os.getenv(env_var, default)
+    p = Path(val)
+    return str(p if p.is_absolute() else _ROOT / p)
+
 DISCORD_WEBHOOK  = os.getenv("DISCORD_WEBHOOK_URL", "")
 ALPACA_PAPER     = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 GOOGLE_SHEET_ID  = os.getenv("GOOGLE_SHEET_ID", "")
-CREDENTIALS_FILE = os.getenv("GMAIL_CREDENTIALS_FILE", "credentials.json")
-TOKEN_FILE       = os.getenv("GMAIL_TOKEN_FILE", "token.json")
+CREDENTIALS_FILE = _resolve("GMAIL_CREDENTIALS_FILE", "credentials.json")
+TOKEN_FILE       = _resolve("GMAIL_TOKEN_FILE", "token.json")
 
 _GREEN = 0x00FF7F
 _RED   = 0xFF4444

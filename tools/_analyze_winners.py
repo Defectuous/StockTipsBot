@@ -2,7 +2,7 @@
 import sqlite3
 from pathlib import Path
 
-conn = sqlite3.connect(str(Path(__file__).parent / "stockbot.db"))
+conn = sqlite3.connect(str(Path(__file__).resolve().parent.parent / "stockbot.db"))
 conn.row_factory = sqlite3.Row
 
 rows = conn.execute("""

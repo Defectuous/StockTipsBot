@@ -4,7 +4,12 @@ Corrects current_balance only — day_start_balance is left untouched so
 tomorrow's per-trade sizing isn't affected until the normal day reset fires.
 """
 import os
+import sys
 import logging
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from dotenv import load_dotenv
 from alpaca.trading.client import TradingClient
 from bot.database import init_db, get_wallet, update_wallet_cash

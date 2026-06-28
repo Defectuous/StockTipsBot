@@ -13,8 +13,11 @@ Usage:
 import argparse
 import os
 import sqlite3
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytz
 from dotenv import load_dotenv
@@ -40,7 +43,7 @@ def _resolve_keys() -> tuple[str, str]:
     raise EnvironmentError("No Alpaca API keys found in .env — set at least one of SML_ALPACA_API_KEY etc.")
 
 ALPACA_KEY, ALPACA_SECRET = _resolve_keys()
-DB_PATH = Path(__file__).parent / "stockbot.db"
+DB_PATH = Path(__file__).resolve().parent.parent / "stockbot.db"
 
 _1MIN  = TimeFrame(1,  TimeFrameUnit.Minute)
 _5MIN  = TimeFrame(5,  TimeFrameUnit.Minute)

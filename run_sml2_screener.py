@@ -1,7 +1,10 @@
 """
-Super screener — real-time WebSocket position monitoring with REST scan loop.
+SML2 screener — real-time WebSocket position monitoring with REST scan loop.
 
-Improvements over run_mid_screener.py:
+Small-cap most-active + MACD/RSI screener ($0.50–$5.00 default range).
+WebSocket upgrade of run_sml_screener.py — same strategy, async fill detection.
+
+WebSocket improvements over run_sml_screener.py:
 
   TradingStream (WebSocket, instant)
     - Order fills fire via threading.Event — no 5-second poll loop
@@ -12,36 +15,31 @@ Improvements over run_mid_screener.py:
     - monitor_positions reads from an in-memory price cache — zero REST calls per position
     - Positions are unsubscribed automatically on close to stay lean
 
-  Position monitor now runs every MONITOR_INTERVAL_SECONDS (default 10s) instead of 60s,
-  costing nothing extra because it uses cached prices rather than REST requests.
-  The scan loop (most-actives + bars analysis) still runs every SCAN_INTERVAL_SECONDS and
-  still uses REST — that cadence is fine because bar resolution is 5-min anyway.
+  Position monitor now runs every MONITOR_INTERVAL_SECONDS (default 10s) instead of
+  SCAN_INTERVAL_SECONDS, costing nothing extra because it uses cached prices.
 
-Config (env vars / .env):
-  SUPER_SCREENER_ID           wallet/provider identifier          default: SUPER
-  SUPER_STARTING_BALANCE      initial wallet (first run only)     default: 500
-  SUPER_MAX_POSITIONS         max concurrent positions            default: 2
-  SUPER_RESERVE_PCT           % of day-start balance in reserve   default: 25
-  TRAILING_STOP_PERCENT       trailing-stop %                     default: 10
-  BUY_COOLDOWN_SECONDS        min secs between buys per stock     default: 86400
-  SCAN_INTERVAL_SECONDS       secs between full most-active scan  default: 60
-  MONITOR_INTERVAL_SECONDS    secs between position checks        default: 10
-  ALPACA_PAPER                true / false                        default: true
-  DISCORD_WEBHOOK_URL         webhook for buy/error alerts        optional
-  PROFIT_LOCK_PCT             gain % to tighten trailing stop     default: 50
-  TIGHT_STOP_PCT              tighter stop % after lock           default: 5
-  RSI_EXIT_LEVEL              RSI overbought exit level           default: 75
-  MAX_HOLD_MINUTES            force-sell after N minutes          default: 120
-  START_TIME_ET               don't scan before this ET time      default: "" (off)
-  STOP_BUY_TIME_ET            no new buys after this ET time      default: "" (off)
-  DUMP_TIME_ET                force-sell all at this ET time      default: "" (off)
-  HARD_STOP_PCT               hard stop % from entry              default: 0 (off)
-  MAX_ENTRY_MOVE_PCT          skip if already up > this % today   default: 0 (off)
-  MAX_ATR                     skip if ATR above this              default: 0 (off)
-  MAX_RVOL                    skip if RVOL above this             default: 0 (off)
-  SUPER_MIN_PRICE             lower price bound                    default: 2.00
-  SUPER_MAX_PRICE             upper price bound                    default: 50.00
-  SUPER_MAX_BUY_AMOUNT        max $ per trade                     default: 500
+Config (env vars or .env):
+  SCREENER_ID             wallet/provider identifier               default: SML2
+  STARTING_BALANCE        initial wallet balance (first run only)  default: 500
+  MAX_POSITIONS           max concurrent open positions            default: 2
+  RESERVE_PCT             % of day-start balance held in reserve   default: 25
+  TRAILING_STOP_PERCENT   trailing-stop distance %                 default: 10
+  BUY_COOLDOWN_SECONDS    min seconds between buys/stock           default: 86400
+  SCAN_INTERVAL_SECONDS   seconds between full scans               default: 60
+  MONITOR_INTERVAL_SECONDS secs between position checks            default: 10
+  ALPACA_PAPER            true / false                             default: true
+  DISCORD_WEBHOOK_URL     webhook for buy/error alerts             optional
+  PROFIT_LOCK_PCT         gain % to tighten trailing stop          default: 50
+  TIGHT_STOP_PCT          tighter stop % after profit lock         default: 5
+  RSI_EXIT_LEVEL          RSI level to exit on (declining)         default: 75
+  MAX_HOLD_MINUTES        force-sell after this many min           default: 120
+  START_TIME_ET           don't scan before this time ET           default: "" (off)
+  STOP_BUY_TIME_ET        stop new buys after this time ET         default: "" (off)
+  DUMP_TIME_ET            force-sell all at clock time ET          default: "" (off)
+  HARD_STOP_PCT           hard stop loss % from entry              default: 0 (off)
+  MAX_ENTRY_MOVE_PCT      skip buys already up > this %            default: 0 (off)
+  MAX_ATR                 skip buys with ATR above this            default: 0 (off)
+  MAX_RVOL                skip buys with RVOL above this           default: 0 (off)
 """
 import asyncio
 import logging
@@ -90,20 +88,20 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("super.log"),
+        logging.FileHandler("sml2.log"),
     ],
 )
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-ALPACA_KEY       = os.getenv("SUPER_ALPACA_API_KEY")    or os.environ["ALPACA_API_KEY"]
-ALPACA_SECRET    = os.getenv("SUPER_ALPACA_API_SECRET") or os.environ["ALPACA_API_SECRET"]
+ALPACA_KEY       = os.getenv("SML2_ALPACA_API_KEY")   or os.getenv("SML_ALPACA_API_KEY")   or os.environ["ALPACA_API_KEY"]
+ALPACA_SECRET    = os.getenv("SML2_ALPACA_API_SECRET") or os.getenv("SML_ALPACA_API_SECRET") or os.environ["ALPACA_API_SECRET"]
 ALPACA_PAPER     = os.getenv("ALPACA_PAPER", "true").lower() == "true"
-SCREENER_ID      = os.getenv("SUPER_SCREENER_ID",        "SUPER")
-STARTING_BALANCE = float(os.getenv("SUPER_STARTING_BALANCE", "500"))
-MAX_POSITIONS    = int(os.getenv("SUPER_MAX_POSITIONS",    "2"))
-RESERVE_PCT      = float(os.getenv("SUPER_RESERVE_PCT",    "25"))
+SCREENER_ID      = os.getenv("SCREENER_ID",            "SML2")
+STARTING_BALANCE = float(os.getenv("STARTING_BALANCE", "500"))
+MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS",       "2"))
+RESERVE_PCT      = float(os.getenv("RESERVE_PCT",       "25"))
 TRAIL_PCT        = float(os.getenv("TRAILING_STOP_PERCENT",   "10"))
 COOLDOWN_SECS    = int(os.getenv("BUY_COOLDOWN_SECONDS",      "86400"))
 SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL_SECONDS",     "60"))
@@ -120,9 +118,6 @@ HARD_STOP_PCT    = float(os.getenv("HARD_STOP_PCT",           "0"))
 MAX_ENTRY_MOVE_PCT = float(os.getenv("MAX_ENTRY_MOVE_PCT",    "0"))
 MAX_ATR          = float(os.getenv("MAX_ATR",                 "0"))
 MAX_RVOL         = float(os.getenv("MAX_RVOL",                "0"))
-MIN_PRICE        = float(os.getenv("SUPER_MIN_PRICE",         "2.00"))
-MAX_PRICE        = float(os.getenv("SUPER_MAX_PRICE",         "50.00"))
-MAX_BUY_AMOUNT   = float(os.getenv("SUPER_MAX_BUY_AMOUNT",   "500.00"))
 
 _RSI_MIN = 50.0
 _RSI_MAX = 65.0
@@ -335,8 +330,8 @@ def _compute_buy_amount() -> float:
     wallet = get_wallet(SCREENER_ID)
     if not wallet:
         return 0.0
-    amount = wallet["day_start_balance"] * (1 - RESERVE_PCT / 100) / MAX_POSITIONS
-    return min(amount, MAX_BUY_AMOUNT)
+    deployable = wallet["day_start_balance"] * (1 - RESERVE_PCT / 100)
+    return deployable / MAX_POSITIONS
 
 
 def _log_wallet() -> None:
@@ -396,7 +391,6 @@ def _check_untracked_positions(trader: Trader) -> None:
         buy_price = float(ap.avg_entry_price)  # type: ignore[union-attr]
         shares    = int(float(ap.qty))          # type: ignore[union-attr]
 
-        # Try to find the original filled buy order for this symbol
         buy_order_id = f"recovered_{sym}_{int(time.time())}"
         buy_time: datetime = datetime.now(timezone.utc)
         try:
@@ -415,14 +409,12 @@ def _check_untracked_positions(trader: Trader) -> None:
         except Exception as e:
             logger.warning("Orphan %s: buy order lookup failed (%s) — using placeholder", sym, e)
 
-        # Insert into DB
         try:
             pos_id = save_position(sym, PROVIDER, shares, buy_price, buy_time, buy_order_id)
         except Exception as e:
             logger.error("Orphan %s: DB insert failed: %s", sym, e)
             continue
 
-        # Find the open trailing stop order
         ts_id = None
         try:
             open_orders = trader.client.get_orders(filter=GetOrdersRequest(  # type: ignore[union-attr]
@@ -635,9 +627,8 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
         logger.info("[%s] Insufficient cash: $%.2f available, $%.2f needed", ts, available, buy_amount)
         return
 
-    # ── 1. Most active stocks in price range ─────────────────────────────────
-    actives = get_most_active_penny_stocks(ALPACA_KEY, ALPACA_SECRET,
-                                           min_price=MIN_PRICE, max_price=MAX_PRICE)
+    # ── 1. Most active penny stocks ───────────────────────────────────────────
+    actives = get_most_active_penny_stocks(ALPACA_KEY, ALPACA_SECRET)
     if not actives:
         logger.info("[%s] No most-active data returned", ts)
         return
@@ -699,10 +690,8 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             passing.append(result)
 
     logger.info(
-        "[%s] Scanned %d stocks ($%.0f-$%.0f) -> %d passing MACD+RSI  "
-        "pos=%d/%d  buy=$%.2f",
-        ts, len(symbols), MIN_PRICE, MAX_PRICE, len(passing),
-        open_count, MAX_POSITIONS, buy_amount,
+        "[%s] Scanned %d stocks -> %d passing MACD+RSI  pos=%d/%d  buy=$%.2f",
+        ts, len(symbols), len(passing), open_count, MAX_POSITIONS, buy_amount,
     )
 
     if not passing:
@@ -825,7 +814,7 @@ def main():
     global _trader
     mode = "PAPER" if ALPACA_PAPER else "LIVE"
     logger.info("=" * 60)
-    logger.info("SUPER screener starting  [%s]  ($%.0f–$%.0f)", SCREENER_ID, MIN_PRICE, MAX_PRICE)
+    logger.info("SML2 screener starting  [%s]", SCREENER_ID)
     logger.info(
         "Mode: %s | MaxPos: %d | Reserve: %.0f%% | Stop: %.0f%% | "
         "Lock: +%.0f%%->%.0f%% | RSI exit: %.0f",
