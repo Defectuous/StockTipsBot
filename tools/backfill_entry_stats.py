@@ -8,6 +8,7 @@ API keys are resolved from the first available screener account in .env.
 Usage:
     python backfill_entry_stats.py                    # all providers
     python backfill_entry_stats.py --provider SML     # one provider only
+    python backfill_entry_stats.py --provider SML2
     python backfill_entry_stats.py --provider MID_SCREENER
 """
 import argparse
@@ -31,7 +32,7 @@ load_dotenv()
 
 def _resolve_keys() -> tuple[str, str]:
     """Return the first available Alpaca key pair across all screener accounts."""
-    for prefix in ("SML", "MID", "SUPER", "LIVE"):
+    for prefix in ("SML", "SML2", "MID", "SUPER", "LIVE"):
         key    = os.getenv(f"{prefix}_ALPACA_API_KEY")
         secret = os.getenv(f"{prefix}_ALPACA_API_SECRET")
         if key and secret:
@@ -162,7 +163,7 @@ def main():
     parser = argparse.ArgumentParser(description="Backfill entry stats for positions.")
     parser.add_argument(
         "--provider", "-p",
-        help="Filter by provider name, e.g. SML, MID, SML_SCREENER (default: all)",
+        help="Filter by provider name, e.g. SML, SML2, MID, SML_SCREENER (default: all)",
         default=None,
     )
     args = parser.parse_args()

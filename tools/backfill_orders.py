@@ -5,7 +5,7 @@ Pairs filled buy and sell orders by symbol, inserts them as closed positions
 in the DB. Skips any pair whose buy_order_id already exists in the DB.
 
 Usage:
-    python backfill_orders.py                        # Jun 17 & 18, SML + MID
+    python backfill_orders.py                        # Jun 17 & 18, SML + SML2 + MID
     python backfill_orders.py --since 2026-06-17     # specific start date
     python backfill_orders.py --screener SML         # one account
 """
@@ -39,6 +39,12 @@ ACCOUNTS = {
         "key_env":    "SML_ALPACA_API_KEY",
         "secret_env": "SML_ALPACA_API_SECRET",
         "provider":   "SML_SCREENER",
+        "paper":      True,
+    },
+    "SML2": {
+        "key_env":    "SML2_ALPACA_API_KEY",
+        "secret_env": "SML2_ALPACA_API_SECRET",
+        "provider":   "SML2_SCREENER",
         "paper":      True,
     },
     "MID": {

@@ -16,6 +16,7 @@ Usage:
     python sync_db.py --screener SML
     python sync_db.py --screener SML MID
     python sync_db.py --screener LIVE
+    python sync_db.py --screener SML2
 """
 import argparse
 import logging
@@ -53,6 +54,13 @@ ACCOUNTS = {
         "secret_env":         "SML_ALPACA_API_SECRET",
         "screener_id":        "SML",
         "provider":           "SML_SCREENER",
+        "paper":              True,
+    },
+    "SML2": {
+        "key_env":            "SML2_ALPACA_API_KEY",
+        "secret_env":         "SML2_ALPACA_API_SECRET",
+        "screener_id":        "SML2",
+        "provider":           "SML2_SCREENER",
         "paper":              True,
     },
     "MID": {
@@ -215,11 +223,11 @@ def main():
         "--screener", nargs="+",
         choices=list(ACCOUNTS),
         metavar="NAME",
-        help="Account(s) to sync: SML, MID, SUPER, LIVE (default: SML MID SUPER)",
+        help="Account(s) to sync: SML, SML2, MID, SUPER, LIVE (default: SML SML2 MID SUPER)",
     )
     args = parser.parse_args()
 
-    names   = args.screener if args.screener else ["SML", "MID", "SUPER"]
+    names   = args.screener if args.screener else ["SML", "SML2", "MID", "SUPER"]
     targets = {n: ACCOUNTS[n] for n in names if n in ACCOUNTS}
 
     if not targets:
