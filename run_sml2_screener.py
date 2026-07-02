@@ -427,6 +427,17 @@ def _check_untracked_positions(trader: Trader) -> None:
         except Exception as e:
             logger.warning("Orphan %s: trailing stop lookup failed: %s", sym, e)
 
+        if not ts_id:
+            # No protective stop found on the broker (e.g. the fill was missed
+            # during a network blip) — submit one now instead of leaving the
+            # position unprotected until another exit rule happens to catch it.
+            new_stop = trader.submit_trailing_stop(sym, shares, TRAIL_PCT)
+            if new_stop:
+                ts_id = str(new_stop.id)
+                logger.info("Orphan %s: no stop found — submitted new one  id=%s", sym, ts_id)
+            else:
+                logger.warning("Orphan %s: registered in DB (pos_id=%d) but no trailing stop found and submit failed — set one manually", sym, pos_id)
+
         if ts_id:
             update_trailing_stop_order(pos_id, ts_id)
             with _ts_lock:
@@ -437,8 +448,6 @@ def _check_untracked_positions(trader: Trader) -> None:
                     "shares":    shares,
                 }
             logger.info("Orphan %s: registered  pos_id=%d  ts=%s", sym, pos_id, ts_id)
-        else:
-            logger.warning("Orphan %s: registered in DB (pos_id=%d) but no trailing stop found — set one manually", sym, pos_id)
 
         _subscribe_prices([sym])
 
@@ -510,20 +519,44 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
                 trader.cancel_order(stop_order_id)
                 with _ts_lock:
                     _ts_to_pos.pop(stop_order_id, None)
-            sell = trader.market_sell(sym, shares)
+
+            # Verify what the broker actually holds before selling — the DB's
+            # share count can drift from the real position (e.g. a trailing
+            # stop fills partially, or a buy fill is misreported). Without this
+            # check a stuck mismatch retries forever every monitor cycle.
+            actual_qty = trader.get_position_qty(sym)
+            if actual_qty <= 0:
+                logger.warning(
+                    "  %s — DB shows %d shares open but broker holds 0; "
+                    "closing DB record at last known price (%s)",
+                    sym, shares, reason,
+                )
+                pnl = (current_price - buy_price) * shares
+                close_position(pos_id, current_price, datetime.now(timezone.utc), pnl)
+                update_wallet_cash(SCREENER_ID, current_price * shares)
+                _unsubscribe_prices([sym])
+                return
+
+            sell_qty = min(shares, actual_qty)
+            if sell_qty < shares:
+                logger.warning(
+                    "  %s — DB shows %d shares but broker holds %d; selling %d",
+                    sym, shares, actual_qty, sell_qty,
+                )
+            sell = trader.market_sell(sym, sell_qty)
             if not sell:
                 return
             filled = _wait_for_fill(str(sell.id), timeout=timeout)
             if not filled:
                 return
             fp  = float(filled.filled_avg_price)
-            pnl = (fp - buy_price) * shares
+            pnl = (fp - buy_price) * sell_qty
             close_position(pos_id, fp, datetime.now(timezone.utc), pnl)
-            update_wallet_cash(SCREENER_ID, fp * shares)
+            update_wallet_cash(SCREENER_ID, fp * sell_qty)
             _unsubscribe_prices([sym])
             logger.info("  SOLD  %s @ $%.4f  PnL=$%+.2f  (%s)", sym, fp, pnl, reason)
             if DISCORD_WEBHOOK:
-                send_close(DISCORD_WEBHOOK, sym, buy_price, fp, shares, pnl,
+                send_close(DISCORD_WEBHOOK, sym, buy_price, fp, sell_qty, pnl,
                            paper=ALPACA_PAPER, reason=reason)
 
         # ── 1. Hard stop ─────────────────────────────────────────────────────

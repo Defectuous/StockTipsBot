@@ -168,6 +168,14 @@ class Trader:
             logger.error("Status check failed for %s: %s", order_id, e)
             return None
 
+    def get_position_qty(self, symbol: str) -> int:
+        """Return currently held share qty for symbol, or 0 if no position exists."""
+        try:
+            pos = self.client.get_open_position(symbol)
+            return int(float(pos.qty))
+        except Exception:
+            return 0
+
     def get_filled_avg_price(self, order_id: str) -> Optional[float]:
         try:
             order = self.client.get_order_by_id(order_id)
