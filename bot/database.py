@@ -39,6 +39,7 @@ def init_db():
                 buy_time                TIMESTAMP NOT NULL,
                 buy_order_id            TEXT,
                 trailing_stop_order_id  TEXT,
+                hard_stop_order_id      TEXT,
                 stop_tightened          INTEGER DEFAULT 0,
                 status                  TEXT DEFAULT 'open',
                 sell_price              REAL,
@@ -81,6 +82,7 @@ def init_db():
             ("change_pct_at_entry",   "REAL"),
             ("macd_crossover_fresh",  "INTEGER"),
             ("rvol_at_entry",         "REAL"),
+            ("hard_stop_order_id",    "TEXT"),
         ]
         for col, typedef in _migrations:
             try:
@@ -137,6 +139,14 @@ def update_trailing_stop_order(position_id: int, order_id: str):
     with _connect() as conn:
         conn.execute(
             "UPDATE positions SET trailing_stop_order_id = ? WHERE id = ?",
+            (order_id, position_id),
+        )
+
+
+def update_hard_stop_order(position_id: int, order_id: str):
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE positions SET hard_stop_order_id = ? WHERE id = ?",
             (order_id, position_id),
         )
 

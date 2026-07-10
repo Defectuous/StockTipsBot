@@ -6,7 +6,7 @@ from typing import Optional, Dict, List
 import pytz
 from alpaca.data import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestBarRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +164,64 @@ def _rvol_time_adjusted(bars15: list, now_et) -> Optional[float]:
         return None
 
     return round(today_vol / avg_prior, 2)
+
+
+def estimate_entry_indicators(
+    data_client: StockHistoricalDataClient,
+    symbol: str,
+    buy_price: float,
+    buy_time: datetime,
+) -> Dict[str, Optional[float]]:
+    """
+    Best-effort reconstruction of entry-time indicators (RSI, ATR, day change %,
+    time-adjusted RVOL) for a position whose original scan-time context is
+    unavailable — e.g. an orphaned position recovered from Alpaca, or a trade
+    reconstructed after the fact from broker order history. Any value the
+    underlying bars can't support comes back None rather than raising.
+    """
+    out: Dict[str, Optional[float]] = {"rsi": None, "atr": None, "change_pct": None, "rvol": None}
+    et_tz  = pytz.timezone("America/New_York")
+    buy_et = buy_time.astimezone(et_tz)
+
+    try:
+        bars5 = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+            start=buy_time - timedelta(hours=6),
+            end=buy_time,
+        )).data.get(symbol, [])
+        closes = [b.close for b in bars5]
+        if len(closes) >= 15:
+            out["rsi"] = _rsi(closes)
+        if len(bars5) >= 15:
+            out["atr"] = _atr(bars5)
+    except Exception as e:
+        logger.debug("estimate_entry_indicators: 5-min bars failed for %s: %s", symbol, e)
+
+    try:
+        daily = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Day,
+            start=buy_time - timedelta(days=7),
+            end=buy_time,
+        )).data.get(symbol, [])
+        if len(daily) >= 2 and daily[-2].close:
+            out["change_pct"] = round((buy_price - daily[-2].close) / daily[-2].close * 100, 2)
+    except Exception as e:
+        logger.debug("estimate_entry_indicators: daily bars failed for %s: %s", symbol, e)
+
+    try:
+        bars15 = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame(15, TimeFrameUnit.Minute),
+            start=buy_time - timedelta(days=3),
+            end=buy_time,
+        )).data.get(symbol, [])
+        out["rvol"] = _rvol_time_adjusted(bars15, buy_et)
+    except Exception as e:
+        logger.debug("estimate_entry_indicators: 15-min bars failed for %s: %s", symbol, e)
+
+    return out
 
 
 def get_stock_data(symbol: str, api_key: str, api_secret: str) -> Optional[Dict]:

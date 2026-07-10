@@ -19,11 +19,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv
+from alpaca.data import StockHistoricalDataClient
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderStatus, OrderSide
 from alpaca.trading.requests import GetOrdersRequest
 
 from bot.database import init_db, _connect
+from bot.market_data import estimate_entry_indicators
 
 load_dotenv()
 
@@ -75,17 +77,23 @@ def _insert_closed(
     sell_time: datetime,
     sell_order_id: str,
     pnl: float,
+    rsi_at_entry: float = None,
+    atr_at_entry: float = None,
+    change_pct_at_entry: float = None,
+    rvol_at_entry: float = None,
 ) -> None:
     with _connect() as conn:
         conn.execute(
             """INSERT INTO positions
                (symbol, provider, shares, buy_price, buy_time, buy_order_id,
-                trailing_stop_order_id, status, sell_price, sell_time, pnl)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'closed', ?, ?, ?)""",
+                trailing_stop_order_id, status, sell_price, sell_time, pnl,
+                rsi_at_entry, atr_at_entry, change_pct_at_entry, rvol_at_entry)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'closed', ?, ?, ?, ?, ?, ?, ?)""",
             (symbol, provider, shares, buy_price,
              buy_time.isoformat(), buy_order_id,
              sell_order_id,
-             sell_price, sell_time.isoformat(), pnl),
+             sell_price, sell_time.isoformat(), pnl,
+             rsi_at_entry, atr_at_entry, change_pct_at_entry, rvol_at_entry),
         )
 
 
@@ -96,8 +104,9 @@ def backfill_account(name: str, acct: dict, since: datetime) -> None:
         logger.warning("[%s] API keys not set — skipping.", name)
         return
 
-    provider = acct["provider"]
-    client   = TradingClient(key, secret, paper=acct["paper"])
+    provider    = acct["provider"]
+    client      = TradingClient(key, secret, paper=acct["paper"])
+    data_client = StockHistoricalDataClient(key, secret)
 
     req    = GetOrdersRequest(status="closed", after=since, limit=500)
     orders = client.get_orders(filter=req)
@@ -149,6 +158,11 @@ def backfill_account(name: str, acct: dict, since: datetime) -> None:
             sell_price = float(s.filled_avg_price)
             pnl        = round((sell_price - buy_price) * buy_qty, 6)
 
+            # Reconstructed trades have no original scan-time context, so
+            # rsi/atr/change_pct/rvol would otherwise be NULL forever — best
+            # effort them from historical bars around the buy fill instead.
+            stats = estimate_entry_indicators(data_client, sym, buy_price, b.filled_at)
+
             _insert_closed(
                 symbol       = sym,
                 provider     = provider,
@@ -160,6 +174,10 @@ def backfill_account(name: str, acct: dict, since: datetime) -> None:
                 sell_time    = s.filled_at,
                 sell_order_id= str(s.id),
                 pnl          = pnl,
+                rsi_at_entry        = stats["rsi"],
+                atr_at_entry        = stats["atr"],
+                change_pct_at_entry = stats["change_pct"],
+                rvol_at_entry       = stats["rvol"],
             )
             logger.info(
                 "[%s]  INSERTED  %s  %d sh  buy=$%.4f  sell=$%.4f  PnL=$%+.2f",

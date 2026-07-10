@@ -65,7 +65,16 @@ def _analyze(
     bars_15m:   list,
     price:      float,
     change_pct: float,
+    vwap_bars:  Optional[list] = None,
 ) -> Optional["ScreenedStock"]:
+    """
+    bars_5m is used for RSI/ATR and should cover enough history to satisfy
+    the 20-bar minimum (a rolling lookback works fine here).
+
+    vwap_bars, if given, is used for VWAP instead of bars_5m — pass a
+    market-open-anchored bar set so VWAP reflects the full session even
+    when bars_5m is a short rolling window for early-session RSI coverage.
+    """
     if len(bars_5m) < 20:
         logger.debug("%s: only %d 5-min bars — skipping", symbol, len(bars_5m))
         return None
@@ -81,7 +90,7 @@ def _analyze(
     closes_15m = [b.close for b in bars_15m]
     macd       = _macd_analysis(closes_15m)
     atr_val    = _atr(bars_5m)
-    vwap_val   = _vwap(bars_5m)
+    vwap_val   = _vwap(vwap_bars if vwap_bars is not None else bars_5m)
 
     return ScreenedStock(
         symbol              = symbol,

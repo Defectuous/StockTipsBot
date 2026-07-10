@@ -5,7 +5,12 @@ from typing import Optional, Tuple
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.models import Order
-from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest, TrailingStopOrderRequest
+from alpaca.trading.requests import (
+    LimitOrderRequest,
+    MarketOrderRequest,
+    StopOrderRequest,
+    TrailingStopOrderRequest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +132,35 @@ class Trader:
             return order
         except Exception as e:
             logger.error("Trailing stop failed for %s: %s", symbol, e)
+            return None
+
+    def submit_stop_loss(
+        self, symbol: str, qty: int, stop_price: float
+    ) -> Optional[Order]:
+        """
+        Place a GTC stop-loss SELL order that rests on the broker at a fixed
+        *stop_price*. Unlike the polled HARD_STOP_PCT check in the screener
+        loops, this fires the instant the exchange prints a trade through the
+        stop — no waiting for the next monitor cycle, which is what let fast
+        drops slip a point or more past the intended percentage.
+        """
+        try:
+            order = self.client.submit_order(
+                StopOrderRequest(
+                    symbol=symbol,
+                    qty=str(qty),
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC,
+                    stop_price=round(stop_price, 4),
+                )
+            )
+            logger.info(
+                "Stop-loss submitted: %s x%d  stop=$%.4f  id=%s",
+                symbol, qty, stop_price, order.id,
+            )
+            return order
+        except Exception as e:
+            logger.error("Stop-loss failed for %s: %s", symbol, e)
             return None
 
     def cancel_order(self, order_id: str) -> bool:

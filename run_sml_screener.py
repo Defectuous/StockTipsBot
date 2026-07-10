@@ -30,15 +30,22 @@ Config (env vars or .env):
   STOP_BUY_TIME_ET        stop new buys after this time ET         default: "" (off)
   DUMP_TIME_ET            force-sell all at clock time ET          default: "" (off)
   HARD_STOP_PCT           hard stop loss % from entry              default: 0 (off)
+                          also submitted as a resting broker-side
+                          stop order at entry, not just polled
+  MIN_GAIN_AT_30M         exit if gain% below this by 30min held   default: -2.0
+  MIN_GAIN_AT_60M         exit if gain% below this by 60min held   default: 0.0
   MAX_ENTRY_MOVE_PCT      skip buys already up > this %            default: 0 (off)
   MAX_ATR                 skip buys with ATR above this            default: 0 (off)
   MAX_RVOL                skip buys with RVOL above this           default: 0 (off)
+  MIN_RVOL                skip buys with RVOL below this           default: 2.0
+  MIN_CHANGE_PCT          skip buys flat/red on the day below this default: 2.0
 """
 import logging
 import os
 import time
 import warnings
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import pytz
 from dotenv import load_dotenv
@@ -58,11 +65,12 @@ from bot.database import (
     record_ticker_alert,
     reset_day_wallet,
     save_position,
+    update_hard_stop_order,
     update_trailing_stop_order,
     update_wallet_cash,
 )
 from bot.discord_notify import send_alert, send_close, send_error
-from bot.market_data import _rsi_series
+from bot.market_data import _rsi_series, _rvol_time_adjusted
 from bot.most_active import get_most_active_penny_stocks
 from bot.screener import _analyze
 from bot.trader import Trader
@@ -103,20 +111,15 @@ HARD_STOP_PCT      = float(os.getenv("HARD_STOP_PCT",        "0"))
 MAX_ENTRY_MOVE_PCT = float(os.getenv("MAX_ENTRY_MOVE_PCT",   "0"))
 MAX_ATR            = float(os.getenv("MAX_ATR",              "0"))
 MAX_RVOL           = float(os.getenv("MAX_RVOL",             "0"))
-
-_RSI_MIN = 50.0
-_RSI_MAX = 65.0
+MIN_RVOL           = float(os.getenv("MIN_RVOL",             "2.0"))
+MIN_CHANGE_PCT     = float(os.getenv("MIN_CHANGE_PCT",        "2.0"))
+MIN_GAIN_AT_30M    = float(os.getenv("MIN_GAIN_AT_30M",       "-2.0"))
+MIN_GAIN_AT_60M    = float(os.getenv("MIN_GAIN_AT_60M",       "0.0"))
 
 PROVIDER = f"{SCREENER_ID}_SCREENER"
 
 _5MIN  = TimeFrame(5,  TimeFrameUnit.Minute)
 _15MIN = TimeFrame(15, TimeFrameUnit.Minute)
-
-
-def _passes(result) -> bool:
-    rsi_ok  = result.rsi_trending_up and _RSI_MIN <= result.rsi <= _RSI_MAX
-    macd_ok = result.macd_above_signal and result.histogram_expanding
-    return rsi_ok and macd_ok
 
 
 def _compute_buy_amount(screener_id: str) -> float:
@@ -175,6 +178,38 @@ def _maybe_reset_day(
     _log_wallet(screener_id)
 
 
+def _exit_position(
+    trader: Trader,
+    screener_id: str,
+    pos_id: int,
+    sym: str,
+    buy_price: float,
+    shares: int,
+    stop_order_id: Optional[str],
+    hard_stop_order_id: Optional[str],
+    reason: str,
+) -> None:
+    """Cancel any resting stop orders, market-sell, and record the close."""
+    if stop_order_id:
+        trader.cancel_order(stop_order_id)
+    if hard_stop_order_id:
+        trader.cancel_order(hard_stop_order_id)
+    sell = trader.market_sell(sym, shares)
+    if not sell:
+        return
+    filled = trader.wait_for_fill(str(sell.id), timeout=30)
+    if not filled:
+        return
+    fp  = float(filled.filled_avg_price)
+    pnl = (fp - buy_price) * shares
+    close_position(pos_id, fp, datetime.now(timezone.utc), pnl)
+    update_wallet_cash(screener_id, fp * shares)
+    logger.info("  SOLD  %s @ $%.4f  PnL=$%+.2f  (%s)", sym, fp, pnl, reason)
+    if DISCORD_WEBHOOK:
+        send_close(DISCORD_WEBHOOK, sym, buy_price, fp, shares, pnl,
+                   paper=ALPACA_PAPER, reason=reason)
+
+
 def monitor_positions(
     trader: Trader,
     data_client: StockHistoricalDataClient,
@@ -208,29 +243,41 @@ def monitor_positions(
         bars5 = {}
 
     for pos in positions:
-        sym            = pos["symbol"]
-        pos_id         = pos["id"]
-        buy_price      = pos["buy_price"]
-        shares         = pos["shares"]
-        stop_order_id  = pos.get("trailing_stop_order_id")
-        stop_tightened = pos.get("stop_tightened", 0)
+        sym                = pos["symbol"]
+        pos_id             = pos["id"]
+        buy_price          = pos["buy_price"]
+        shares             = pos["shares"]
+        stop_order_id      = pos.get("trailing_stop_order_id")
+        hard_stop_order_id = pos.get("hard_stop_order_id")
+        stop_tightened     = pos.get("stop_tightened", 0)
 
-        # ── 1. DB sync: check if trailing stop was already filled on Alpaca ──
-        if stop_order_id:
+        # ── 1. DB sync: check if either resting stop order already filled ──
+        closed_via_sync = False
+        for oid, label in ((stop_order_id, "Trailing stop"), (hard_stop_order_id, "Hard stop")):
+            if not oid:
+                continue
             try:
-                stop_order = trader.client.get_order_by_id(stop_order_id)
-                if stop_order.status.value == "filled":
-                    fill_price = float(stop_order.filled_avg_price)
-                    pnl        = (fill_price - buy_price) * shares
-                    close_position(pos_id, fill_price, datetime.now(timezone.utc), pnl)
-                    update_wallet_cash(screener_id, fill_price * shares)
-                    logger.info("  SYNC  %s closed @ $%.4f  PnL=$%+.2f", sym, fill_price, pnl)
-                    if DISCORD_WEBHOOK:
-                        send_close(DISCORD_WEBHOOK, sym, buy_price, fill_price, shares, pnl,
-                                   paper=ALPACA_PAPER, reason="Trailing stop filled")
-                    continue
+                stop_order = trader.client.get_order_by_id(oid)
             except Exception as e:
-                logger.debug("Stop order check failed for %s: %s", sym, e)
+                logger.debug("Stop order check failed for %s (%s): %s", sym, label, e)
+                continue
+            if stop_order.status.value == "filled":
+                fill_price = float(stop_order.filled_avg_price)
+                pnl        = (fill_price - buy_price) * shares
+                close_position(pos_id, fill_price, datetime.now(timezone.utc), pnl)
+                update_wallet_cash(screener_id, fill_price * shares)
+                other = hard_stop_order_id if oid == stop_order_id else stop_order_id
+                if other:
+                    trader.cancel_order(other)
+                logger.info("  SYNC  %s closed @ $%.4f  PnL=$%+.2f  (%s filled)",
+                            sym, fill_price, pnl, label)
+                if DISCORD_WEBHOOK:
+                    send_close(DISCORD_WEBHOOK, sym, buy_price, fill_price, shares, pnl,
+                               paper=ALPACA_PAPER, reason=f"{label} filled")
+                closed_via_sync = True
+                break
+        if closed_via_sync:
+            continue
 
         snap = snaps.get(sym)
         if not snap:
@@ -245,44 +292,37 @@ def monitor_positions(
 
         gain_pct = (current_price - buy_price) / buy_price * 100
 
-        # ── 2. Hard stop loss ─────────────────────────────────────────────────
+        # ── 2. Hard stop loss (poll fallback — the resting broker order from
+        #      entry normally catches this first via the DB-sync check above;
+        #      this only fires if that order was never placed or is missing) ──
         if HARD_STOP_PCT > 0 and gain_pct <= -HARD_STOP_PCT:
             logger.info("  HARD STOP %s  gain=%.2f%%  (limit=%.0f%%)", sym, gain_pct, HARD_STOP_PCT)
-            if stop_order_id:
-                trader.cancel_order(stop_order_id)
-            sell = trader.market_sell(sym, shares)
-            if sell:
-                filled = trader.wait_for_fill(str(sell.id), timeout=30)
-                if filled:
-                    fp  = float(filled.filled_avg_price)
-                    pnl = (fp - buy_price) * shares
-                    close_position(pos_id, fp, datetime.now(timezone.utc), pnl)
-                    update_wallet_cash(screener_id, fp * shares)
-                    logger.info("  SOLD  %s @ $%.4f  PnL=$%+.2f  (hard stop)", sym, fp, pnl)
-                    if DISCORD_WEBHOOK:
-                        send_close(DISCORD_WEBHOOK, sym, buy_price, fp, shares, pnl,
-                                   paper=ALPACA_PAPER, reason=f"Hard stop -{HARD_STOP_PCT:.0f}%")
+            _exit_position(trader, screener_id, pos_id, sym, buy_price, shares,
+                            stop_order_id, hard_stop_order_id, f"Hard stop -{HARD_STOP_PCT:.0f}%")
             continue
 
-        # ── 3. Time exit ──────────────────────────────────────────────────────
+        # ── 3. Time exit — graduated checkpoints at 30/60min tighten the bar,
+        #      MAX_HOLD_MINUTES is the unconditional final cutoff. This closes
+        #      the gap where a position drifts down 3-5% for the full hold
+        #      window without ever tripping the trailing or hard stop. ──────
         buy_dt   = datetime.fromisoformat(pos["buy_time"])
         held_min = (now - buy_dt).total_seconds() / 60
         if held_min >= MAX_HOLD_MINUTES:
-            logger.info("  TIME EXIT %s  held %.0fm  gain=%+.1f%%", sym, held_min, gain_pct)
-            if stop_order_id:
-                trader.cancel_order(stop_order_id)
-            sell = trader.market_sell(sym, shares)
-            if sell:
-                filled = trader.wait_for_fill(str(sell.id), timeout=30)
-                if filled:
-                    fp  = float(filled.filled_avg_price)
-                    pnl = (fp - buy_price) * shares
-                    close_position(pos_id, fp, datetime.now(timezone.utc), pnl)
-                    update_wallet_cash(screener_id, fp * shares)
-                    logger.info("  SOLD  %s @ $%.4f  PnL=$%+.2f  (time exit)", sym, fp, pnl)
-                    if DISCORD_WEBHOOK:
-                        send_close(DISCORD_WEBHOOK, sym, buy_price, fp, shares, pnl,
-                                   paper=ALPACA_PAPER, reason="Max hold time exit")
+            logger.info("  TIME EXIT %s  held %.0fm  gain=%+.1f%%  (max hold)", sym, held_min, gain_pct)
+            _exit_position(trader, screener_id, pos_id, sym, buy_price, shares,
+                            stop_order_id, hard_stop_order_id, "Max hold time exit")
+            continue
+        elif held_min >= 60 and gain_pct < MIN_GAIN_AT_60M:
+            logger.info("  TIME EXIT %s  held %.0fm  gain=%+.1f%% < %.1f%% required by 60m",
+                        sym, held_min, gain_pct, MIN_GAIN_AT_60M)
+            _exit_position(trader, screener_id, pos_id, sym, buy_price, shares,
+                            stop_order_id, hard_stop_order_id, "60-min checkpoint exit")
+            continue
+        elif held_min >= 30 and gain_pct < MIN_GAIN_AT_30M:
+            logger.info("  TIME EXIT %s  held %.0fm  gain=%+.1f%% < %.1f%% required by 30m",
+                        sym, held_min, gain_pct, MIN_GAIN_AT_30M)
+            _exit_position(trader, screener_id, pos_id, sym, buy_price, shares,
+                            stop_order_id, hard_stop_order_id, "30-min checkpoint exit")
             continue
 
         # ── 4. Dump time ──────────────────────────────────────────────────────
@@ -291,21 +331,8 @@ def monitor_positions(
             dump_h, dump_m = map(int, DUMP_TIME_ET.split(":"))
             if (now_et.hour, now_et.minute) >= (dump_h, dump_m):
                 logger.info("  DUMP EXIT %s  %s ET  gain=%+.1f%%", sym, DUMP_TIME_ET, gain_pct)
-                if stop_order_id:
-                    trader.cancel_order(stop_order_id)
-                sell = trader.market_sell(sym, shares)
-                if sell:
-                    filled = trader.wait_for_fill(str(sell.id), timeout=30)
-                    if filled:
-                        fp  = float(filled.filled_avg_price)
-                        pnl = (fp - buy_price) * shares
-                        close_position(pos_id, fp, datetime.now(timezone.utc), pnl)
-                        update_wallet_cash(screener_id, fp * shares)
-                        logger.info("  SOLD  %s @ $%.4f  PnL=$%+.2f  (dump time)",
-                                    sym, fp, pnl)
-                        if DISCORD_WEBHOOK:
-                            send_close(DISCORD_WEBHOOK, sym, buy_price, fp, shares, pnl,
-                                       paper=ALPACA_PAPER, reason=f"Dump time {DUMP_TIME_ET} ET")
+                _exit_position(trader, screener_id, pos_id, sym, buy_price, shares,
+                                stop_order_id, hard_stop_order_id, f"Dump time {DUMP_TIME_ET} ET")
                 continue
 
         # ── 5. RSI exit ───────────────────────────────────────────────────────
@@ -319,21 +346,8 @@ def monitor_positions(
                 if rsi > RSI_EXIT_LEVEL and rsi_falling:
                     logger.info("  RSI EXIT %s  RSI=%.1f (falling)  gain=%+.1f%%",
                                 sym, rsi, gain_pct)
-                    if stop_order_id:
-                        trader.cancel_order(stop_order_id)
-                    sell = trader.market_sell(sym, shares)
-                    if sell:
-                        filled = trader.wait_for_fill(str(sell.id), timeout=30)
-                        if filled:
-                            fp  = float(filled.filled_avg_price)
-                            pnl = (fp - buy_price) * shares
-                            close_position(pos_id, fp, datetime.now(timezone.utc), pnl)
-                            update_wallet_cash(screener_id, fp * shares)
-                            logger.info("  SOLD  %s @ $%.4f  PnL=$%+.2f  (RSI exit)",
-                                        sym, fp, pnl)
-                            if DISCORD_WEBHOOK:
-                                send_close(DISCORD_WEBHOOK, sym, buy_price, fp, shares, pnl,
-                                           paper=ALPACA_PAPER, reason="RSI overbought exit")
+                    _exit_position(trader, screener_id, pos_id, sym, buy_price, shares,
+                                    stop_order_id, hard_stop_order_id, "RSI overbought exit")
                     continue
 
         # ── 6. Profit lock ────────────────────────────────────────────────────
@@ -408,7 +422,6 @@ def scan_and_trade(
     volume_map = {s.symbol: s.volume for s in actives}
 
     # ── 2. Snapshots ──────────────────────────────────────────────────────────
-    prev_vol_map: dict = {}
     try:
         snaps = data_client.get_stock_snapshot(
             StockSnapshotRequest(symbol_or_symbols=symbols)
@@ -419,12 +432,15 @@ def scan_and_trade(
                 prev  = snap.previous_daily_bar.close
                 chg   = round((price - prev) / prev * 100, 2) if prev else 0.0
                 price_map[sym] = (price, chg)
-                if snap.previous_daily_bar.volume:
-                    prev_vol_map[sym] = snap.previous_daily_bar.volume
     except Exception as e:
         logger.warning("Snapshot fetch failed: %s", e)
 
     # ── 3. Bars ───────────────────────────────────────────────────────────────
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+
+    # Rolling window for RSI/ATR — reaches the 20-bar minimum immediately after
+    # open (pulls in pre-market bars) instead of waiting ~100 min for enough
+    # regular-session bars to accumulate.
     try:
         bars5 = data_client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=symbols,
@@ -435,6 +451,19 @@ def scan_and_trade(
     except Exception as e:
         logger.warning("5-min bar fetch failed: %s", e)
         bars5 = {}
+
+    # Market-open-anchored window used only for VWAP, so VWAP reflects the
+    # full session rather than a short rolling lookback.
+    try:
+        bars5_vwap = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=_5MIN,
+            start=market_open.astimezone(pytz.UTC),
+            end=now,
+        )).data
+    except Exception as e:
+        logger.warning("VWAP bar fetch failed: %s", e)
+        bars5_vwap = {}
 
     try:
         bars15 = data_client.get_stock_bars(StockBarsRequest(
@@ -459,8 +488,9 @@ def scan_and_trade(
             list(bars15.get(sym, [])),
             price,
             chg,
+            vwap_bars=list(bars5_vwap.get(sym, [])),
         )
-        if result and _passes(result):
+        if result and result.passes:
             passing.append(result)
 
     logger.info(
@@ -499,16 +529,24 @@ def scan_and_trade(
                         sym, stock.atr, MAX_ATR)
             continue
 
-        today_vol = volume_map.get(sym, 0)
-        prev_vol  = prev_vol_map.get(sym)
-        rvol_now  = (today_vol / prev_vol) if prev_vol else None
-        if MAX_RVOL > 0 and rvol_now and rvol_now > MAX_RVOL:
-            logger.info("  SKIP %s — RVOL %.1fx exceeds limit %.0fx",
-                        sym, rvol_now, MAX_RVOL)
+        if MIN_CHANGE_PCT > 0 and (stock.change_pct is None or stock.change_pct < MIN_CHANGE_PCT):
+            logger.info("  SKIP %s — change %.2f%% < %.1f%% min", sym, stock.change_pct or 0.0, MIN_CHANGE_PCT)
             continue
 
-        logger.info("  BUY  %s  $%.4f  RSI=%.1f  chg=%+.2f%%  budget=$%.2f",
-                    sym, stock.price, stock.rsi, stock.change_pct, buy_amount)
+        rvol_ta = _rvol_time_adjusted(list(bars15.get(sym, [])), now_et)
+        if MIN_RVOL > 0 and (rvol_ta is None or rvol_ta < MIN_RVOL):
+            logger.info("  SKIP %s — RVOL %.1fx < %.1fx min", sym, rvol_ta or 0.0, MIN_RVOL)
+            continue
+        if MAX_RVOL > 0 and rvol_ta and rvol_ta > MAX_RVOL:
+            logger.info("  SKIP %s — RVOL %.1fx > %.0fx max", sym, rvol_ta, MAX_RVOL)
+            continue
+
+        logger.info(
+            "  BUY  %s  $%.4f  RSI=%.1f  chg=%+.2f%% (min %.1f%%)  RVOL=%.1fx (min %.1fx)  "
+            "VWAP=%s  budget=$%.2f",
+            sym, stock.price, stock.rsi, stock.change_pct, MIN_CHANGE_PCT, rvol_ta or 0.0,
+            MIN_RVOL, "ok" if stock.above_vwap else "fail", buy_amount,
+        )
 
         order, err = trader.buy_stock(sym, buy_amount, stock.price)
         if err:
@@ -544,7 +582,7 @@ def scan_and_trade(
             atr_at_entry         = stock.atr,
             change_pct_at_entry  = stock.change_pct,
             macd_crossover_fresh = stock.macd_crossover,
-            rvol_at_entry        = round(rvol_now, 3) if rvol_now else None,
+            rvol_at_entry        = round(rvol_ta, 3) if rvol_ta else None,
         )
 
         ts_order = trader.submit_trailing_stop(sym, fill_qty, TRAIL_PCT)
@@ -553,6 +591,19 @@ def scan_and_trade(
             logger.info("  STOP  %s  trail=%.0f%%  id=%s", sym, TRAIL_PCT, ts_order.id)
         else:
             logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
+
+        # Resting hard stop-loss, in addition to the trailing stop — catches
+        # fast drops the instant the exchange trades through it instead of
+        # waiting for the next monitor poll (SCAN_INTERVAL_SECONDS later).
+        if HARD_STOP_PCT > 0:
+            hard_stop_price = fill_price * (1 - HARD_STOP_PCT / 100)
+            hs_order = trader.submit_stop_loss(sym, fill_qty, hard_stop_price)
+            if hs_order:
+                update_hard_stop_order(pos_id, str(hs_order.id))
+                logger.info("  STOP  %s  hard=-%.0f%% ($%.4f)  id=%s",
+                            sym, HARD_STOP_PCT, hard_stop_price, hs_order.id)
+            else:
+                logger.warning("  Hard stop-loss failed for %s — relying on poll fallback", sym)
 
         if DISCORD_WEBHOOK:
             send_alert(
@@ -581,6 +632,18 @@ def main():
     if START_TIME_ET or STOP_BUY_TIME_ET or DUMP_TIME_ET:
         logger.info("Window: start=%s  stop_buy=%s  dump=%s ET",
                     START_TIME_ET or "off", STOP_BUY_TIME_ET or "off", DUMP_TIME_ET or "off")
+    logger.info(
+        "Entry filters: MIN_RVOL=%.1fx  MAX_RVOL=%s  MIN_CHANGE_PCT=%.1f%%  "
+        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s",
+        MIN_RVOL, MAX_RVOL if MAX_RVOL > 0 else "off", MIN_CHANGE_PCT,
+        MAX_ENTRY_MOVE_PCT if MAX_ENTRY_MOVE_PCT > 0 else "off",
+        MAX_ATR if MAX_ATR > 0 else "off",
+    )
+    logger.info(
+        "Exit rules: HARD_STOP_PCT=%s (resting + polled)  30m>=%.1f%%  60m>=%.1f%%  MAX_HOLD=%dm",
+        HARD_STOP_PCT if HARD_STOP_PCT > 0 else "off",
+        MIN_GAIN_AT_30M, MIN_GAIN_AT_60M, MAX_HOLD_MINUTES,
+    )
     logger.info("=" * 60)
 
     init_db()
