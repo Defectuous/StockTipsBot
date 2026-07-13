@@ -11,10 +11,12 @@ stockbot.db
 stockbot.test.db
 stockbot.log
 sml.log
+sml2.log
 mid.log
 super.log
 live.log
 old.token.json
+pi_data/
 
 # Generated output
 reports/
