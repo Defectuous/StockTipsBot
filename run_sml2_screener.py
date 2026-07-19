@@ -46,6 +46,10 @@ Config (env vars or .env):
   MAX_RVOL                skip buys with RVOL above this           default: 0 (off)
   MIN_RVOL                skip buys with RVOL below this           default: 2.0
   MIN_CHANGE_PCT          skip buys flat/red on the day below this default: 2.0
+  RSI_ENTRY_MIN           skip buys with RSI below this            default: 60
+  RSI_ENTRY_MAX           skip buys with RSI above this            default: 70
+  REQUIRE_MACD_FRESH_CROSSOVER  skip buys without a fresh MACD     default: true
+                          crossover (not just above-signal)
 """
 import asyncio
 import logging
@@ -127,6 +131,9 @@ MAX_ATR          = float(os.getenv("MAX_ATR",                 "0"))
 MAX_RVOL         = float(os.getenv("MAX_RVOL",                "0"))
 MIN_RVOL         = float(os.getenv("MIN_RVOL",                "2.0"))
 MIN_CHANGE_PCT   = float(os.getenv("MIN_CHANGE_PCT",           "2.0"))
+RSI_ENTRY_MIN    = float(os.getenv("RSI_ENTRY_MIN",            "60"))
+RSI_ENTRY_MAX    = float(os.getenv("RSI_ENTRY_MAX",            "70"))
+REQUIRE_MACD_FRESH_CROSSOVER = os.getenv("REQUIRE_MACD_FRESH_CROSSOVER", "true").lower() == "true"
 MIN_GAIN_AT_30M  = float(os.getenv("MIN_GAIN_AT_30M",          "-2.0"))
 MIN_GAIN_AT_60M  = float(os.getenv("MIN_GAIN_AT_60M",          "0.0"))
 
@@ -841,6 +848,15 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             logger.info("  SKIP  %s — change %.2f%% < %.1f%% min", sym, stock.change_pct or 0.0, MIN_CHANGE_PCT)
             continue
 
+        if not (RSI_ENTRY_MIN <= stock.rsi <= RSI_ENTRY_MAX):
+            logger.info("  SKIP  %s — RSI %.1f outside entry band %.0f-%.0f",
+                        sym, stock.rsi, RSI_ENTRY_MIN, RSI_ENTRY_MAX)
+            continue
+
+        if REQUIRE_MACD_FRESH_CROSSOVER and not stock.macd_crossover:
+            logger.info("  SKIP  %s — MACD crossover not fresh", sym)
+            continue
+
         rvol_ta = _rvol_time_adjusted(list(bars15.get(sym, [])), now_et)
         if MIN_RVOL > 0 and (rvol_ta is None or rvol_ta < MIN_RVOL):
             logger.info("  SKIP  %s — RVOL %.1fx < %.1fx min", sym, rvol_ta or 0.0, MIN_RVOL)
@@ -967,10 +983,11 @@ def main():
         )
     logger.info(
         "Entry filters: MIN_RVOL=%.1fx  MAX_RVOL=%s  MIN_CHANGE_PCT=%.1f%%  "
-        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s",
+        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  RSI_ENTRY=%.0f-%.0f  MACD_FRESH=%s",
         MIN_RVOL, MAX_RVOL if MAX_RVOL > 0 else "off", MIN_CHANGE_PCT,
         MAX_ENTRY_MOVE_PCT if MAX_ENTRY_MOVE_PCT > 0 else "off",
         MAX_ATR if MAX_ATR > 0 else "off",
+        RSI_ENTRY_MIN, RSI_ENTRY_MAX, REQUIRE_MACD_FRESH_CROSSOVER,
     )
     logger.info(
         "Exit rules: HARD_STOP_PCT=%s (resting + polled)  30m>=%.1f%%  60m>=%.1f%%  MAX_HOLD=%dm",
