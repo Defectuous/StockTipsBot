@@ -144,6 +144,10 @@ class Trader:
         stop — no waiting for the next monitor cycle, which is what let fast
         drops slip a point or more past the intended percentage.
         """
+        # Alpaca requires whole-cent increments at/above $1; sub-penny (up to
+        # 4 decimals) is only accepted below $1. Rounding to 4 decimals
+        # unconditionally produces prices like $1.178 that get rejected.
+        tick_price = round(stop_price, 2) if stop_price >= 1 else round(stop_price, 4)
         try:
             order = self.client.submit_order(
                 StopOrderRequest(
@@ -151,12 +155,12 @@ class Trader:
                     qty=str(qty),
                     side=OrderSide.SELL,
                     time_in_force=TimeInForce.GTC,
-                    stop_price=round(stop_price, 4),
+                    stop_price=tick_price,
                 )
             )
             logger.info(
                 "Stop-loss submitted: %s x%d  stop=$%.4f  id=%s",
-                symbol, qty, stop_price, order.id,
+                symbol, qty, tick_price, order.id,
             )
             return order
         except Exception as e:
