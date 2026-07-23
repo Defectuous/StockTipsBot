@@ -5,7 +5,7 @@ Source of truth is still `.env` + the defaults in each `run_*_screener.py` docst
 is a snapshot for quick reference, not a replacement. Update the relevant table (and add a
 changelog entry below) any time a setting changes.
 
-**Last updated:** 2026-07-22
+**Last updated:** 2026-07-23
 
 ## Deployed screeners
 
@@ -48,6 +48,7 @@ Same as SML plus entry gates added 2026-07-22 (commit `04e261f`):
 | RSI_ENTRY_MIN / RSI_ENTRY_MAX | 60 / 70 | code default |
 | REQUIRE_MACD_FRESH_CROSSOVER | true | code default |
 | MONITOR_INTERVAL_SECONDS | 10s (WebSocket price cache) | code default |
+| MAX_ENTRY_MOVE_PCT | skip if already up >15% | `.env` (`SML2_MAX_ENTRY_MOVE_PCT` override, 2026-07-23) |
 
 All other settings (MAX_POSITIONS, stops, hold time, entry filters, timing) match SML above — both
 read the same shared `.env` keys.
@@ -83,6 +84,13 @@ Planned to go live in paper first per [memory: Live Trading Budget ($500)].
 ---
 
 ## Changelog
+
+- **2026-07-23** — Raised SML2's `MAX_ENTRY_MOVE_PCT` from 8% to 15%. On 2026-07-22 SML2
+  (and SML) skipped every buy all day; several repeat-offender tickers (LICN, AIRJ, MWC,
+  SNTG) were consistently 15-25% up and got filtered out at the 8% cap. Added a
+  `SML2_MAX_ENTRY_MOVE_PCT` env override (same pattern as `SML2_ALPACA_API_KEY`) in
+  `run_sml2_screener.py` so this only affects SML2 — SML/MID/SUPER stay at the shared 8%
+  via `MAX_ENTRY_MOVE_PCT`.
 
 - **2026-07-22** — Initial baseline captured from `.env` + code defaults. Fixed a stop-loss
   rounding bug in `bot/trader.py` (`submit_stop_loss` now rounds to 2 decimals at/above $1,
