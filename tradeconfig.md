@@ -30,7 +30,7 @@ changelog entry below) any time a setting changes.
 | MAX_HOLD_MINUTES | 90 | .env |
 | MIN_GAIN_AT_30M | -2.0% | default |
 | MIN_GAIN_AT_60M | 0.0% | default |
-| MAX_ENTRY_MOVE_PCT | skip if already up >8% | .env |
+| MAX_ENTRY_MOVE_PCT | skip if already up >10% | .env (was 8%, raised 2026-07-23) |
 | MIN_CHANGE_PCT | 2.0% min daily gain to buy | .env |
 | MIN_RVOL | 1.5x | .env |
 | RSI_EXIT_LEVEL | 75 (falling) | .env |
@@ -38,6 +38,9 @@ changelog entry below) any time a setting changes.
 | MACD fresh-crossover gate | none (no gate) | — |
 | START_TIME_ET / STOP_BUY_TIME_ET / DUMP_TIME_ET | 09:30 / 11:45 / 12:00 | .env |
 | BUY_COOLDOWN_SECONDS | 86400 (once/day/stock) | .env |
+
+Note: `MAX_ENTRY_MOVE_PCT` is a shared key — this change also applies to MID and SUPER
+below (they have no per-screener override, unlike SML2).
 
 ## SML2 (`run_sml2_screener.py`)
 
@@ -84,6 +87,11 @@ Planned to go live in paper first per [memory: Live Trading Budget ($500)].
 ---
 
 ## Changelog
+
+- **2026-07-23** — Raised shared `MAX_ENTRY_MOVE_PCT` from 8% to 10% on the Pi's `.env`
+  (applied there first, local `.env` updated to match). Since this key has no per-screener
+  override except SML2, it affects SML, MID, and SUPER together — SML2 stays independent
+  at 15% via `SML2_MAX_ENTRY_MOVE_PCT`.
 
 - **2026-07-23** — Raised SML2's `MAX_ENTRY_MOVE_PCT` from 8% to 15%. On 2026-07-22 SML2
   (and SML) skipped every buy all day; several repeat-offender tickers (LICN, AIRJ, MWC,
