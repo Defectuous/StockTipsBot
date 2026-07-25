@@ -5,7 +5,7 @@ Source of truth is still `.env` + the defaults in each `run_*_screener.py` docst
 is a snapshot for quick reference, not a replacement. Update the relevant table (and add a
 changelog entry below) any time a setting changes.
 
-**Last updated:** 2026-07-23
+**Last updated:** 2026-07-23 (cooldown scoping fix)
 
 ## Deployed screeners
 
@@ -37,7 +37,7 @@ changelog entry below) any time a setting changes.
 | RSI entry band | none (no gate) | — |
 | MACD fresh-crossover gate | none (no gate) | — |
 | START_TIME_ET / STOP_BUY_TIME_ET / DUMP_TIME_ET | 09:30 / 11:45 / 12:00 | .env |
-| BUY_COOLDOWN_SECONDS | 86400 (once/day/stock) | .env |
+| BUY_COOLDOWN_SECONDS | 86400 (once/day/stock, **per-screener** as of 2026-07-23) | .env |
 
 Note: `MAX_ENTRY_MOVE_PCT` is a shared key — this change also applies to MID and SUPER
 below (they have no per-screener override, unlike SML2).
@@ -87,6 +87,21 @@ Planned to go live in paper first per [memory: Live Trading Budget ($500)].
 ---
 
 ## Changelog
+
+- **2026-07-23** — Fixed the buy cooldown (`BUY_COOLDOWN_SECONDS`) to be scoped per
+  screener instead of global. `ticker_alerts` (the table backing `is_ticker_on_cooldown`
+  / `record_ticker_alert` in `bot/database.py`) had no `provider` column, so a buy by any
+  one screener put that symbol on cooldown for *all* screeners for 24h. Discovered while
+  reviewing 2026-07-23's no-trade day for SML2: SML bought BATL at 09:43 ET, which then
+  showed up as `SKIP BATL — cooldown` in SML2's log from 09:51 on, even though SML2 never
+  traded it — SML2 lost access to the day's best-qualifying candidate (RSI 63.6, RVOL 1.7x,
+  fresh MACD cross) purely because a different bot got there first. Added a `provider`
+  column to `ticker_alerts` (migrated automatically via `init_db()`, existing rows keep
+  `provider=''` and simply age out — no cooldown carries over from before the fix) and
+  threaded `PROVIDER` through both functions and all five screener entry points (SML, SML2,
+  MID, SUPER, LIVE). Each screener's cooldown is now independent, matching the intent of
+  running SML/SML2 as separate A/B variants ([memory: SML/SML2 Focus]). Needs a `git pull`
+  and a service restart on the Pi to take effect there — this fix only lives in the repo so far.
 
 - **2026-07-23** — Raised shared `MAX_ENTRY_MOVE_PCT` from 8% to 10% on the Pi's `.env`
   (applied there first, local `.env` updated to match). Since this key has no per-screener

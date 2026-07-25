@@ -25,10 +25,11 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS ticker_alerts (
                 symbol     TEXT NOT NULL,
+                provider   TEXT NOT NULL DEFAULT '',
                 alerted_at TIMESTAMP NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_ticker_alerts_symbol
-                ON ticker_alerts (symbol, alerted_at);
+                ON ticker_alerts (symbol, provider, alerted_at);
 
             CREATE TABLE IF NOT EXISTS positions (
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,6 +90,10 @@ def init_db():
                 conn.execute(f"ALTER TABLE positions ADD COLUMN {col} {typedef}")
             except Exception:
                 pass
+        try:
+            conn.execute("ALTER TABLE ticker_alerts ADD COLUMN provider TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
     logger.info("Database ready: %s", DB_PATH)
 
 
@@ -231,22 +236,23 @@ def update_wallet_cash(screener_id: str, delta: float) -> None:
         )
 
 
-def is_ticker_on_cooldown(symbol: str, cooldown_seconds: int) -> bool:
+def is_ticker_on_cooldown(symbol: str, cooldown_seconds: int, provider: str) -> bool:
     with _connect() as conn:
         row = conn.execute(
             """SELECT 1 FROM ticker_alerts
                WHERE symbol = ?
+                 AND provider = ?
                  AND alerted_at > datetime('now', ? || ' seconds')""",
-            (symbol, f"-{cooldown_seconds}"),
+            (symbol, provider, f"-{cooldown_seconds}"),
         ).fetchone()
         return row is not None
 
 
-def record_ticker_alert(symbol: str):
+def record_ticker_alert(symbol: str, provider: str):
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO ticker_alerts (symbol, alerted_at) VALUES (?, datetime('now'))",
-            (symbol,),
+            "INSERT INTO ticker_alerts (symbol, provider, alerted_at) VALUES (?, ?, datetime('now'))",
+            (symbol, provider),
         )
 
 

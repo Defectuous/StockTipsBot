@@ -832,7 +832,7 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
 
         sym = stock.symbol
 
-        if is_ticker_on_cooldown(sym, COOLDOWN_SECS):
+        if is_ticker_on_cooldown(sym, COOLDOWN_SECS, PROVIDER):
             logger.info("  SKIP  %s — cooldown", sym)
             continue
 
@@ -957,7 +957,7 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
                 paper          = ALPACA_PAPER,
             )
 
-        record_ticker_alert(sym)
+        record_ticker_alert(sym, PROVIDER)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

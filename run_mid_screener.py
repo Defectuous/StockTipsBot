@@ -487,7 +487,7 @@ def scan_and_trade(
 
         sym = stock.symbol
 
-        if is_ticker_on_cooldown(sym, COOLDOWN_SECS):
+        if is_ticker_on_cooldown(sym, COOLDOWN_SECS, PROVIDER):
             logger.info("  SKIP %s — cooldown", sym)
             continue
 
@@ -570,7 +570,7 @@ def scan_and_trade(
                 paper          = ALPACA_PAPER,
             )
 
-        record_ticker_alert(sym)
+        record_ticker_alert(sym, PROVIDER)
 
 
 def main():
