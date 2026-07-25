@@ -5,7 +5,7 @@ Source of truth is still `.env` + the defaults in each `run_*_screener.py` docst
 is a snapshot for quick reference, not a replacement. Update the relevant table (and add a
 changelog entry below) any time a setting changes.
 
-**Last updated:** 2026-07-23 (cooldown scoping fix)
+**Last updated:** 2026-07-25 (SML2 RSI entry floor lowered)
 
 ## Deployed screeners
 
@@ -48,7 +48,7 @@ Same as SML plus entry gates added 2026-07-22 (commit `04e261f`):
 
 | Setting | Value | Source |
 |---|---|---|
-| RSI_ENTRY_MIN / RSI_ENTRY_MAX | 60 / 70 | code default |
+| RSI_ENTRY_MIN / RSI_ENTRY_MAX | 55 / 70 | `.env` (min lowered from 60, 2026-07-25) |
 | REQUIRE_MACD_FRESH_CROSSOVER | true | code default |
 | MONITOR_INTERVAL_SECONDS | 10s (WebSocket price cache) | code default |
 | MAX_ENTRY_MOVE_PCT | skip if already up >15% | `.env` (`SML2_MAX_ENTRY_MOVE_PCT` override, 2026-07-23) |
@@ -87,6 +87,18 @@ Planned to go live in paper first per [memory: Live Trading Budget ($500)].
 ---
 
 ## Changelog
+
+- **2026-07-25** — Lowered SML2's `RSI_ENTRY_MIN` from 60 to 55 via `.env` (was
+  previously only a code default, not env-exposed). Reviewing 2026-07-24's SML2 log
+  showed NVD hovering RSI 55.9–59.9 continuously for 90 minutes (10:03–11:33 ET),
+  repeatedly missing the 60 floor by a point or two while also needing a simultaneous
+  fresh MACD cross — the single largest cluster of near-miss rejections that day (46
+  skips). BATL showed the same pattern earlier (RSI 54.5–57.9). `RSI_ENTRY_MIN`/`_MAX`
+  are read only by `run_sml2_screener.py`, so no shared-key collision risk with
+  SML/MID/SUPER — no per-screener-prefixed override needed, unlike `MAX_ENTRY_MOVE_PCT`.
+  `RSI_ENTRY_MAX` stays at 70 (code default). This is an `.env`-only change (the code
+  already read `RSI_ENTRY_MIN` generically) — needs the `.env` update + a
+  `screener-sml2.service` restart on the Pi, no code deploy required.
 
 - **2026-07-23** — Fixed the buy cooldown (`BUY_COOLDOWN_SECONDS`) to be scoped per
   screener instead of global. `ticker_alerts` (the table backing `is_ticker_on_cooldown`
