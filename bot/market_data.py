@@ -73,6 +73,17 @@ def _macd_analysis(closes: List[float]) -> Optional[dict]:
     crossover = (macd > signal) and was_below
     histogram_expanding = histogram > 0 and histogram > prev_histogram
 
+    # How many consecutive bars (from the most recent backward) MACD has held
+    # above signal — a small count means the crossover just happened (more
+    # prone to false starts/chop); a larger count means the trend is more
+    # established. 0 if MACD isn't currently above signal.
+    bars_above_signal = 0
+    for m, s in reversed(pairs):
+        if m > s:
+            bars_above_signal += 1
+        else:
+            break
+
     return {
         "macd":                round(macd,      4),
         "signal":              round(signal,    4),
@@ -80,6 +91,7 @@ def _macd_analysis(closes: List[float]) -> Optional[dict]:
         "crossover":           crossover,
         "above_signal":        macd > signal,
         "histogram_expanding": histogram_expanding,
+        "bars_above_signal":   bars_above_signal,
     }
 
 

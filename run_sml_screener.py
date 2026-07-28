@@ -39,6 +39,12 @@ Config (env vars or .env):
   MAX_RVOL                skip buys with RVOL above this           default: 0 (off)
   MIN_RVOL                skip buys with RVOL below this           default: 2.0
   MIN_CHANGE_PCT          skip buys flat/red on the day below this default: 2.0
+  MACD_MIN_BARS_ABOVE_SIGNAL  skip buys where MACD crossed above    default: 0 (off)
+                          signal fewer than this many 15-min bars
+                          ago — filters out the freshest crossovers,
+                          which backtested worse than more-established
+                          ones (avg PnL -$1.62 fresh vs +$1.32 with
+                          some confirmation, in the 2026-06 to 07 data)
 """
 import logging
 import os
@@ -113,6 +119,7 @@ MAX_ATR            = float(os.getenv("MAX_ATR",              "0"))
 MAX_RVOL           = float(os.getenv("MAX_RVOL",             "0"))
 MIN_RVOL           = float(os.getenv("MIN_RVOL",             "2.0"))
 MIN_CHANGE_PCT     = float(os.getenv("MIN_CHANGE_PCT",        "2.0"))
+MACD_MIN_BARS_ABOVE_SIGNAL = int(os.getenv("MACD_MIN_BARS_ABOVE_SIGNAL", "0"))
 MIN_GAIN_AT_30M    = float(os.getenv("MIN_GAIN_AT_30M",       "-2.0"))
 MIN_GAIN_AT_60M    = float(os.getenv("MIN_GAIN_AT_60M",       "0.0"))
 
@@ -352,13 +359,19 @@ def monitor_positions(
 
         # ── 6. Profit lock ────────────────────────────────────────────────────
         if not stop_tightened and gain_pct >= PROFIT_LOCK_PCT:
-            logger.info("  LOCK  %s  +%.1f%% -> tightening stop %.0f%% -> %.0f%%",
-                        sym, gain_pct, TRAIL_PCT, TIGHT_STOP_PCT)
-            cancelled = trader.cancel_order(stop_order_id) if stop_order_id else True
+            # Whichever stop type is currently resting (trailing or hard —
+            # they're mutually exclusive, see entry logic) gets cancelled and
+            # replaced with a tight trailing stop to lock in gains.
+            active_stop_id = stop_order_id or hard_stop_order_id
+            logger.info("  LOCK  %s  +%.1f%% -> tightening stop -> %.0f%% trailing",
+                        sym, gain_pct, TIGHT_STOP_PCT)
+            cancelled = trader.cancel_order(active_stop_id) if active_stop_id else True
             if cancelled:
                 new_stop = trader.submit_trailing_stop(sym, shares, TIGHT_STOP_PCT)
                 if new_stop:
                     mark_stop_tightened(pos_id, str(new_stop.id))
+                    if hard_stop_order_id:
+                        update_hard_stop_order(pos_id, None)
                     logger.info("  STOP  %s tightened to %.0f%%  id=%s",
                                 sym, TIGHT_STOP_PCT, new_stop.id)
             else:
@@ -533,6 +546,11 @@ def scan_and_trade(
             logger.info("  SKIP %s — change %.2f%% < %.1f%% min", sym, stock.change_pct or 0.0, MIN_CHANGE_PCT)
             continue
 
+        if MACD_MIN_BARS_ABOVE_SIGNAL > 0 and stock.macd_bars_above_signal < MACD_MIN_BARS_ABOVE_SIGNAL:
+            logger.info("  SKIP %s — MACD crossover too fresh (%d bars < %d min)",
+                        sym, stock.macd_bars_above_signal, MACD_MIN_BARS_ABOVE_SIGNAL)
+            continue
+
         rvol_ta = _rvol_time_adjusted(list(bars15.get(sym, [])), now_et)
         if MIN_RVOL > 0 and (rvol_ta is None or rvol_ta < MIN_RVOL):
             logger.info("  SKIP %s — RVOL %.1fx < %.1fx min", sym, rvol_ta or 0.0, MIN_RVOL)
@@ -585,16 +603,13 @@ def scan_and_trade(
             rvol_at_entry        = round(rvol_ta, 3) if rvol_ta else None,
         )
 
-        ts_order = trader.submit_trailing_stop(sym, fill_qty, TRAIL_PCT)
-        if ts_order:
-            update_trailing_stop_order(pos_id, str(ts_order.id))
-            logger.info("  STOP  %s  trail=%.0f%%  id=%s", sym, TRAIL_PCT, ts_order.id)
-        else:
-            logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
-
-        # Resting hard stop-loss, in addition to the trailing stop — catches
-        # fast drops the instant the exchange trades through it instead of
-        # waiting for the next monitor poll (SCAN_INTERVAL_SECONDS later).
+        # Alpaca reserves the full share qty against the first resting sell
+        # order it accepts, so a trailing stop and a hard stop-loss can never
+        # both rest at once on the same shares — the second submit always
+        # fails with "insufficient qty available for order". Prefer the hard
+        # stop (tighter, fixed-price, fires the instant price trades through
+        # it) when enabled, falling back to the trailing stop otherwise or if
+        # the hard-stop submit itself fails.
         if HARD_STOP_PCT > 0:
             hard_stop_price = fill_price * (1 - HARD_STOP_PCT / 100)
             hs_order = trader.submit_stop_loss(sym, fill_qty, hard_stop_price)
@@ -603,7 +618,20 @@ def scan_and_trade(
                 logger.info("  STOP  %s  hard=-%.0f%% ($%.4f)  id=%s",
                             sym, HARD_STOP_PCT, hard_stop_price, hs_order.id)
             else:
-                logger.warning("  Hard stop-loss failed for %s — relying on poll fallback", sym)
+                logger.warning("  Hard stop failed for %s — falling back to trailing stop", sym)
+                ts_order = trader.submit_trailing_stop(sym, fill_qty, TRAIL_PCT)
+                if ts_order:
+                    update_trailing_stop_order(pos_id, str(ts_order.id))
+                    logger.info("  STOP  %s  trail=%.0f%%  id=%s", sym, TRAIL_PCT, ts_order.id)
+                else:
+                    logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
+        else:
+            ts_order = trader.submit_trailing_stop(sym, fill_qty, TRAIL_PCT)
+            if ts_order:
+                update_trailing_stop_order(pos_id, str(ts_order.id))
+                logger.info("  STOP  %s  trail=%.0f%%  id=%s", sym, TRAIL_PCT, ts_order.id)
+            else:
+                logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
 
         if DISCORD_WEBHOOK:
             send_alert(
@@ -634,10 +662,11 @@ def main():
                     START_TIME_ET or "off", STOP_BUY_TIME_ET or "off", DUMP_TIME_ET or "off")
     logger.info(
         "Entry filters: MIN_RVOL=%.1fx  MAX_RVOL=%s  MIN_CHANGE_PCT=%.1f%%  "
-        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s",
+        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  MACD_MIN_BARS_ABOVE_SIGNAL=%s",
         MIN_RVOL, MAX_RVOL if MAX_RVOL > 0 else "off", MIN_CHANGE_PCT,
         MAX_ENTRY_MOVE_PCT if MAX_ENTRY_MOVE_PCT > 0 else "off",
         MAX_ATR if MAX_ATR > 0 else "off",
+        MACD_MIN_BARS_ABOVE_SIGNAL if MACD_MIN_BARS_ABOVE_SIGNAL > 0 else "off",
     )
     logger.info(
         "Exit rules: HARD_STOP_PCT=%s (resting + polled)  30m>=%.1f%%  60m>=%.1f%%  MAX_HOLD=%dm",

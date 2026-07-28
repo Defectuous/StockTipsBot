@@ -148,7 +148,7 @@ def update_trailing_stop_order(position_id: int, order_id: str):
         )
 
 
-def update_hard_stop_order(position_id: int, order_id: str):
+def update_hard_stop_order(position_id: int, order_id: Optional[str]):
     with _connect() as conn:
         conn.execute(
             "UPDATE positions SET hard_stop_order_id = ? WHERE id = ?",

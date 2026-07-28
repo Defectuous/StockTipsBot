@@ -47,6 +47,7 @@ class ScreenedStock:
     rsi_trending_up:     bool
     macd_above_signal:   bool
     macd_crossover:      bool
+    macd_bars_above_signal: int
     histogram_expanding: bool
     atr:                 Optional[float]
     vwap:                Optional[float]
@@ -100,6 +101,7 @@ def _analyze(
         rsi_trending_up     = rsi_trending_up,
         macd_above_signal   = macd["above_signal"]        if macd else False,
         macd_crossover      = macd["crossover"]           if macd else False,
+        macd_bars_above_signal = macd["bars_above_signal"] if macd else 0,
         histogram_expanding = macd["histogram_expanding"] if macd else False,
         atr                 = atr_val,
         vwap                = vwap_val,

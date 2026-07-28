@@ -488,23 +488,27 @@ def _check_untracked_positions(trader: Trader, data_client: StockHistoricalDataC
         except Exception as e:
             logger.warning("Orphan %s: stop order lookup failed: %s", sym, e)
 
-        if not ts_id:
+        if not ts_id and not hs_id:
             # No protective stop found on the broker (e.g. the fill was missed
             # during a network blip) — submit one now instead of leaving the
             # position unprotected until another exit rule happens to catch it.
-            new_stop = trader.submit_trailing_stop(sym, shares, TRAIL_PCT)
-            if new_stop:
-                ts_id = str(new_stop.id)
-                logger.info("Orphan %s: no trailing stop found — submitted new one  id=%s", sym, ts_id)
-            else:
-                logger.warning("Orphan %s: registered in DB (pos_id=%d) but no trailing stop found and submit failed — set one manually", sym, pos_id)
-
-        if not hs_id and HARD_STOP_PCT > 0:
-            hard_stop_price = buy_price * (1 - HARD_STOP_PCT / 100)
-            new_hs = trader.submit_stop_loss(sym, shares, hard_stop_price)
-            if new_hs:
-                hs_id = str(new_hs.id)
-                logger.info("Orphan %s: no hard stop found — submitted new one  id=%s", sym, hs_id)
+            # Only one stop type can rest on the shares at once (see entry
+            # logic), so prefer the hard stop when enabled, else trailing.
+            if HARD_STOP_PCT > 0:
+                hard_stop_price = buy_price * (1 - HARD_STOP_PCT / 100)
+                new_hs = trader.submit_stop_loss(sym, shares, hard_stop_price)
+                if new_hs:
+                    hs_id = str(new_hs.id)
+                    logger.info("Orphan %s: no resting stop found — submitted hard stop  id=%s", sym, hs_id)
+                else:
+                    logger.warning("Orphan %s: hard stop submit failed — trying trailing stop", sym)
+            if not hs_id:
+                new_stop = trader.submit_trailing_stop(sym, shares, TRAIL_PCT)
+                if new_stop:
+                    ts_id = str(new_stop.id)
+                    logger.info("Orphan %s: no resting stop found — submitted trailing stop  id=%s", sym, ts_id)
+                else:
+                    logger.warning("Orphan %s: registered in DB (pos_id=%d) but no stop order found and submit failed — set one manually", sym, pos_id)
 
         if ts_id:
             update_trailing_stop_order(pos_id, ts_id)
@@ -677,19 +681,25 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
 
         # ── 5. Profit lock ────────────────────────────────────────────────────
         if not stop_tightened and gain_pct >= PROFIT_LOCK_PCT:
+            # Whichever stop type is currently resting (trailing or hard —
+            # they're mutually exclusive, see entry logic) gets cancelled and
+            # replaced with a tight trailing stop to lock in gains.
+            active_stop_id = stop_order_id or hard_stop_order_id
             logger.info(
-                "  LOCK  %s  +%.1f%% -> tightening stop %.0f%% -> %.0f%%",
-                sym, gain_pct, TRAIL_PCT, TIGHT_STOP_PCT,
+                "  LOCK  %s  +%.1f%% -> tightening stop -> %.0f%% trailing",
+                sym, gain_pct, TIGHT_STOP_PCT,
             )
-            cancelled = trader.cancel_order(stop_order_id) if stop_order_id else True
+            cancelled = trader.cancel_order(active_stop_id) if active_stop_id else True
             if cancelled:
                 new_stop = trader.submit_trailing_stop(sym, shares, TIGHT_STOP_PCT)
                 if new_stop:
                     new_id = str(new_stop.id)
                     mark_stop_tightened(pos_id, new_id)
+                    if hard_stop_order_id:
+                        update_hard_stop_order(pos_id, None)
                     with _ts_lock:
-                        _ts_to_pos.pop(stop_order_id, None)
-                    _register_stops(pos_id, sym, buy_price, shares, new_id, hard_stop_order_id)
+                        _ts_to_pos.pop(active_stop_id, None)
+                    _register_stops(pos_id, sym, buy_price, shares, new_id, None)
                     logger.info("  STOP  %s tightened to %.0f%%  id=%s",
                                 sym, TIGHT_STOP_PCT, new_id)
             else:
@@ -912,18 +922,14 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             rvol_at_entry        = round(rvol_ta, 3) if rvol_ta else None,
         )
 
+        # Alpaca reserves the full share qty against the first resting sell
+        # order it accepts, so a trailing stop and a hard stop-loss can never
+        # both rest at once on the same shares — the second submit always
+        # fails with "insufficient qty available for order". Prefer the hard
+        # stop (tighter, fixed-price, fires the instant price trades through
+        # it) when enabled, falling back to the trailing stop otherwise or if
+        # the hard-stop submit itself fails.
         ts_id = None
-        ts_order = trader.submit_trailing_stop(sym, fill_qty, TRAIL_PCT)
-        if ts_order:
-            ts_id = str(ts_order.id)
-            update_trailing_stop_order(pos_id, ts_id)
-            logger.info("  STOP  %s  trail=%.0f%%  id=%s", sym, TRAIL_PCT, ts_id)
-        else:
-            logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
-
-        # Resting hard stop-loss, in addition to the trailing stop — catches
-        # fast drops the instant the exchange trades through it instead of
-        # waiting for the next monitor cycle.
         hs_id = None
         if HARD_STOP_PCT > 0:
             hard_stop_price = fill_price * (1 - HARD_STOP_PCT / 100)
@@ -934,7 +940,22 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
                 logger.info("  STOP  %s  hard=-%.0f%% ($%.4f)  id=%s",
                             sym, HARD_STOP_PCT, hard_stop_price, hs_id)
             else:
-                logger.warning("  Hard stop-loss failed for %s — relying on poll fallback", sym)
+                logger.warning("  Hard stop-loss failed for %s — falling back to trailing stop", sym)
+                ts_order = trader.submit_trailing_stop(sym, fill_qty, TRAIL_PCT)
+                if ts_order:
+                    ts_id = str(ts_order.id)
+                    update_trailing_stop_order(pos_id, ts_id)
+                    logger.info("  STOP  %s  trail=%.0f%%  id=%s", sym, TRAIL_PCT, ts_id)
+                else:
+                    logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
+        else:
+            ts_order = trader.submit_trailing_stop(sym, fill_qty, TRAIL_PCT)
+            if ts_order:
+                ts_id = str(ts_order.id)
+                update_trailing_stop_order(pos_id, ts_id)
+                logger.info("  STOP  %s  trail=%.0f%%  id=%s", sym, TRAIL_PCT, ts_id)
+            else:
+                logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
 
         # Register in memory so TradingStream callback can close without a DB lookup
         if ts_id or hs_id:
