@@ -28,7 +28,9 @@ Config (env vars or .env):
   MAX_HOLD_MINUTES        force-sell after this many min           default: 120
   START_TIME_ET           don't scan before this time ET           default: "" (off)
   STOP_BUY_TIME_ET        stop new buys after this time ET         default: "" (off)
+                          override with SML_STOP_BUY_TIME_ET (use "off" to disable)
   DUMP_TIME_ET            force-sell all at clock time ET          default: "" (off)
+                          override with SML_DUMP_TIME_ET
   HARD_STOP_PCT           hard stop loss % from entry              default: 0 (off)
                           also submitted as a resting broker-side
                           stop order at entry, not just polled
@@ -111,8 +113,14 @@ TIGHT_STOP_PCT  = float(os.getenv("TIGHT_STOP_PCT",         "5"))
 RSI_EXIT_LEVEL  = float(os.getenv("RSI_EXIT_LEVEL",         "75"))
 MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES",        "120"))
 START_TIME_ET     = os.getenv("START_TIME_ET",               "")
-STOP_BUY_TIME_ET  = os.getenv("STOP_BUY_TIME_ET",            "")
-DUMP_TIME_ET      = os.getenv("DUMP_TIME_ET",                "")
+_stop_buy_override = os.getenv("SML_STOP_BUY_TIME_ET")
+if _stop_buy_override is None:
+    STOP_BUY_TIME_ET = os.getenv("STOP_BUY_TIME_ET", "")
+elif _stop_buy_override.lower() == "off":
+    STOP_BUY_TIME_ET = ""
+else:
+    STOP_BUY_TIME_ET = _stop_buy_override
+DUMP_TIME_ET      = os.getenv("SML_DUMP_TIME_ET") or os.getenv("DUMP_TIME_ET", "")
 HARD_STOP_PCT      = float(os.getenv("HARD_STOP_PCT",        "0"))
 MAX_ENTRY_MOVE_PCT = float(os.getenv("MAX_ENTRY_MOVE_PCT",   "0"))
 MAX_ATR            = float(os.getenv("MAX_ATR",              "0"))
