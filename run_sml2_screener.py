@@ -49,8 +49,16 @@ Config (env vars or .env):
   MIN_CHANGE_PCT          skip buys flat/red on the day below this default: 2.0
   RSI_ENTRY_MIN           skip buys with RSI below this            default: 60
   RSI_ENTRY_MAX           skip buys with RSI above this            default: 70
-  REQUIRE_MACD_FRESH_CROSSOVER  skip buys without a fresh MACD     default: true
-                          crossover (not just above-signal)
+  MACD_MIN_BARS_ABOVE_SIGNAL  skip buys where MACD crossed above    default: 3
+                          signal fewer than this many 15-min bars
+                          ago — filters out the freshest crossovers.
+                          Live data through 2026-07-29 backs this:
+                          SML fresh-crossover trades averaged -$1.75
+                          (27% win rate, n=48) vs +$1.32 (46% win
+                          rate, n=13) for confirmed ones, so SML2
+                          now requires confirmation instead of
+                          freshness. Override with
+                          SML2_MACD_MIN_BARS_ABOVE_SIGNAL.
 """
 import asyncio
 import logging
@@ -134,7 +142,10 @@ MIN_RVOL         = float(os.getenv("MIN_RVOL",                "2.0"))
 MIN_CHANGE_PCT   = float(os.getenv("MIN_CHANGE_PCT",           "2.0"))
 RSI_ENTRY_MIN    = float(os.getenv("RSI_ENTRY_MIN",            "60"))
 RSI_ENTRY_MAX    = float(os.getenv("RSI_ENTRY_MAX",            "70"))
-REQUIRE_MACD_FRESH_CROSSOVER = os.getenv("REQUIRE_MACD_FRESH_CROSSOVER", "true").lower() == "true"
+MACD_MIN_BARS_ABOVE_SIGNAL = int(
+    os.getenv("SML2_MACD_MIN_BARS_ABOVE_SIGNAL")
+    or os.getenv("MACD_MIN_BARS_ABOVE_SIGNAL", "3")
+)
 MIN_GAIN_AT_30M  = float(os.getenv("MIN_GAIN_AT_30M",          "-2.0"))
 MIN_GAIN_AT_60M  = float(os.getenv("MIN_GAIN_AT_60M",          "0.0"))
 
@@ -864,8 +875,9 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
                         sym, stock.rsi, RSI_ENTRY_MIN, RSI_ENTRY_MAX)
             continue
 
-        if REQUIRE_MACD_FRESH_CROSSOVER and not stock.macd_crossover:
-            logger.info("  SKIP  %s — MACD crossover not fresh", sym)
+        if MACD_MIN_BARS_ABOVE_SIGNAL > 0 and stock.macd_bars_above_signal < MACD_MIN_BARS_ABOVE_SIGNAL:
+            logger.info("  SKIP  %s — MACD crossover too fresh (%d bars < %d min)",
+                        sym, stock.macd_bars_above_signal, MACD_MIN_BARS_ABOVE_SIGNAL)
             continue
 
         rvol_ta = _rvol_time_adjusted(list(bars15.get(sym, [])), now_et)
@@ -1005,11 +1017,12 @@ def main():
         )
     logger.info(
         "Entry filters: MIN_RVOL=%.1fx  MAX_RVOL=%s  MIN_CHANGE_PCT=%.1f%%  "
-        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  RSI_ENTRY=%.0f-%.0f  MACD_FRESH=%s",
+        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  RSI_ENTRY=%.0f-%.0f  MACD_MIN_BARS_ABOVE_SIGNAL=%s",
         MIN_RVOL, MAX_RVOL if MAX_RVOL > 0 else "off", MIN_CHANGE_PCT,
         MAX_ENTRY_MOVE_PCT if MAX_ENTRY_MOVE_PCT > 0 else "off",
         MAX_ATR if MAX_ATR > 0 else "off",
-        RSI_ENTRY_MIN, RSI_ENTRY_MAX, REQUIRE_MACD_FRESH_CROSSOVER,
+        RSI_ENTRY_MIN, RSI_ENTRY_MAX,
+        MACD_MIN_BARS_ABOVE_SIGNAL if MACD_MIN_BARS_ABOVE_SIGNAL > 0 else "off",
     )
     logger.info(
         "Exit rules: HARD_STOP_PCT=%s (resting + polled)  30m>=%.1f%%  60m>=%.1f%%  MAX_HOLD=%dm",
