@@ -130,6 +130,21 @@ def _rsi(closes: List[float], period: int = 14) -> Optional[float]:
     return round(100 - (100 / (1 + rs)), 2)
 
 
+def _price_velocity_pct(bars1: list, lookback: int = 3) -> Optional[float]:
+    """
+    % change from the close *lookback* 1-minute bars ago to the latest close.
+    Short-window velocity signal — catches a move while it's still small
+    instead of waiting for a daily-change threshold to trip.
+    """
+    if len(bars1) < lookback + 1:
+        return None
+    prev  = bars1[-1 - lookback].close
+    latest = bars1[-1].close
+    if not prev:
+        return None
+    return round((latest - prev) / prev * 100, 2)
+
+
 def _vwap(bars: list) -> Optional[float]:
     """VWAP: Σ(typical_price × volume) / Σ(volume) over the provided bars."""
     total_pv = 0.0

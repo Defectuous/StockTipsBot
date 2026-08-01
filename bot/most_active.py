@@ -14,11 +14,15 @@ from typing import Dict, List, Optional, Tuple
 from alpaca.data import StockHistoricalDataClient
 from alpaca.data.historical.screener import ScreenerClient
 from alpaca.data.requests import MarketMoversRequest, MostActivesRequest, StockSnapshotRequest
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import AssetClass, AssetStatus
+from alpaca.trading.requests import GetAssetsRequest
 
 logger = logging.getLogger(__name__)
 
 _FETCH_TOP_ACTIVES = 100
 _FETCH_TOP_MOVERS  = 50
+_SNAPSHOT_CHUNK_SIZE = 200   # per-request symbol cap to stay under Alpaca's URL/size limits
 
 MIN_PRICE_PENNY  = 0.50
 MAX_PRICE_PENNY  = 5.00
@@ -180,4 +184,79 @@ def get_volume_surge_stocks(
         ))
 
     results.sort(key=lambda s: s.volume_ratio, reverse=True)
+    return results
+
+
+def get_tradable_asset_symbols(api_key: str, api_secret: str) -> List[str]:
+    """
+    Full tradable US-equity common-stock universe — meant to be pulled once
+    per trading day and cached by the caller (RUNNER's Stage A). Excludes
+    preferred shares / warrants / units via a symbol-shape heuristic (class
+    markers show up as '.' or '-' in the ticker).
+    """
+    client = TradingClient(api_key, api_secret, paper=True)
+    try:
+        assets = client.get_all_assets(GetAssetsRequest(
+            asset_class=AssetClass.US_EQUITY,
+            status=AssetStatus.ACTIVE,
+        ))
+    except Exception as e:
+        logger.error("Failed to fetch tradable assets: %s", e)
+        return []
+
+    return [
+        a.symbol for a in assets
+        if a.tradable and "." not in a.symbol and "-" not in a.symbol
+    ]
+
+
+def get_universe_snapshot(
+    api_key:    str,
+    api_secret: str,
+    symbols:    List[str],
+    min_price:  float = 0.10,
+    max_price:  float = 10.00,
+) -> List[ActivePennyStock]:
+    """
+    Bulk-snapshot an arbitrary symbol list (chunked to stay under Alpaca's
+    per-request limits) and filter to [min_price, max_price). RUNNER's
+    Stage-B per-cycle pass over the cached Stage-A universe — unlike
+    get_most_active_penny_stocks, this doesn't depend on Alpaca's
+    pre-ranked most-actives/movers lists at all.
+    """
+    if not symbols:
+        return []
+
+    data = StockHistoricalDataClient(api_key, api_secret)
+    snapshots: Dict = {}
+    for i in range(0, len(symbols), _SNAPSHOT_CHUNK_SIZE):
+        chunk = symbols[i:i + _SNAPSHOT_CHUNK_SIZE]
+        try:
+            snapshots.update(data.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=chunk)))
+        except Exception as e:
+            logger.error("Universe snapshot chunk failed (%d symbols): %s", len(chunk), e)
+
+    results = []
+    for symbol, snap in snapshots.items():
+        if not snap or not snap.daily_bar:
+            continue
+
+        price = snap.daily_bar.close
+        if price < min_price or price >= max_price:
+            continue
+
+        change_pct = None
+        if snap.previous_daily_bar and snap.previous_daily_bar.close:
+            prev = snap.previous_daily_bar.close
+            change_pct = round((price - prev) / prev * 100, 2)
+
+        results.append(ActivePennyStock(
+            symbol      = symbol,
+            price       = price,
+            change_pct  = change_pct,
+            volume      = snap.daily_bar.volume,
+            trade_count = snap.daily_bar.trade_count,
+        ))
+
+    results.sort(key=lambda s: s.volume, reverse=True)
     return results

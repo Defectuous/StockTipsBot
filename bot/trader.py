@@ -31,10 +31,16 @@ class Trader:
         symbol: str,
         budget_usd: float,
         current_price: float,
+        slippage_pct: float = 0.5,
     ) -> Tuple[Optional[Order], Optional[str]]:
         """
         Buy as many whole shares of *symbol* as *budget_usd* allows at
         *current_price*. Returns (order, None) on success or (None, error_str).
+
+        *slippage_pct* widens the limit price above current_price — the
+        0.5% default suits SML/SML2's calmer RSI-bounce entries; a faster,
+        more volatile strategy (e.g. RUNNER) should pass a wider buffer or
+        risk missing fills disproportionately often.
         """
         shares = int(budget_usd / current_price)
         if shares < 1:
@@ -43,7 +49,7 @@ class Trader:
                 f"(need at least ${current_price:.4f} for 1 share)"
             )
 
-        limit_price = round(current_price * 1.005, 2)
+        limit_price = round(current_price * (1 + slippage_pct / 100), 2)
         cost = shares * limit_price
         try:
             bp = float(self.client.get_account().buying_power)

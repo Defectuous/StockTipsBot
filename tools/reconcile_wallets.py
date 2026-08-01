@@ -1,7 +1,8 @@
 """
-Reconcile DB wallet current_balance against Alpaca live cash for MID and SML.
-Corrects current_balance only — day_start_balance is left untouched so
-tomorrow's per-trade sizing isn't affected until the normal day reset fires.
+Reconcile DB wallet current_balance against Alpaca live cash for each tier
+with a dedicated (or fallback) API key. Corrects current_balance only —
+day_start_balance is left untouched so tomorrow's per-trade sizing isn't
+affected until the normal day reset fires.
 """
 import os
 import sys
@@ -33,6 +34,16 @@ ACCOUNTS = [
         "id":     "SML",
         "key":    os.getenv("SML_ALPACA_API_KEY")  or os.environ["ALPACA_API_KEY"],
         "secret": os.getenv("SML_ALPACA_API_SECRET") or os.environ["ALPACA_API_SECRET"],
+    },
+    {
+        "id":     "SML2",
+        "key":    os.getenv("SML2_ALPACA_API_KEY")  or os.environ["ALPACA_API_KEY"],
+        "secret": os.getenv("SML2_ALPACA_API_SECRET") or os.environ["ALPACA_API_SECRET"],
+    },
+    {
+        "id":     "RUNNER",
+        "key":    os.getenv("RUNNER_ALPACA_API_KEY")  or os.environ["ALPACA_API_KEY"],
+        "secret": os.getenv("RUNNER_ALPACA_API_SECRET") or os.environ["ALPACA_API_SECRET"],
     },
 ]
 
