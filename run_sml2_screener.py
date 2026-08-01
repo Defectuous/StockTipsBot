@@ -148,6 +148,7 @@ MACD_MIN_BARS_ABOVE_SIGNAL = int(
 )
 MIN_GAIN_AT_30M  = float(os.getenv("MIN_GAIN_AT_30M",          "-2.0"))
 MIN_GAIN_AT_60M  = float(os.getenv("MIN_GAIN_AT_60M",          "0.0"))
+EXCLUDE_SYMBOLS  = {s.strip().upper() for s in os.getenv("EXCLUDE_SYMBOLS", "").split(",") if s.strip()}
 
 PROVIDER = f"{SCREENER_ID}_SCREENER"
 
@@ -853,6 +854,10 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
 
         sym = stock.symbol
 
+        if sym in EXCLUDE_SYMBOLS:
+            logger.info("  SKIP  %s — on exclude list", sym)
+            continue
+
         if is_ticker_on_cooldown(sym, COOLDOWN_SECS, PROVIDER):
             logger.info("  SKIP  %s — cooldown", sym)
             continue
@@ -960,6 +965,10 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
                     logger.info("  STOP  %s  trail=%.0f%%  id=%s", sym, TRAIL_PCT, ts_id)
                 else:
                     logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
+                    if DISCORD_WEBHOOK:
+                        send_error(DISCORD_WEBHOOK,
+                                   f"⚠️ **{sym}** ({provider}) bought with NO stop-loss resting — "
+                                   f"both hard stop and trailing stop failed. Set one manually on Alpaca now.")
         else:
             ts_order = trader.submit_trailing_stop(sym, fill_qty, TRAIL_PCT)
             if ts_order:
@@ -968,6 +977,10 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
                 logger.info("  STOP  %s  trail=%.0f%%  id=%s", sym, TRAIL_PCT, ts_id)
             else:
                 logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
+                if DISCORD_WEBHOOK:
+                    send_error(DISCORD_WEBHOOK,
+                               f"⚠️ **{sym}** ({provider}) bought with NO stop-loss resting — "
+                               f"trailing stop failed. Set one manually on Alpaca now.")
 
         # Register in memory so TradingStream callback can close without a DB lookup
         if ts_id or hs_id:
@@ -1017,12 +1030,13 @@ def main():
         )
     logger.info(
         "Entry filters: MIN_RVOL=%.1fx  MAX_RVOL=%s  MIN_CHANGE_PCT=%.1f%%  "
-        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  RSI_ENTRY=%.0f-%.0f  MACD_MIN_BARS_ABOVE_SIGNAL=%s",
+        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  RSI_ENTRY=%.0f-%.0f  MACD_MIN_BARS_ABOVE_SIGNAL=%s  EXCLUDE_SYMBOLS=%s",
         MIN_RVOL, MAX_RVOL if MAX_RVOL > 0 else "off", MIN_CHANGE_PCT,
         MAX_ENTRY_MOVE_PCT if MAX_ENTRY_MOVE_PCT > 0 else "off",
         MAX_ATR if MAX_ATR > 0 else "off",
         RSI_ENTRY_MIN, RSI_ENTRY_MAX,
         MACD_MIN_BARS_ABOVE_SIGNAL if MACD_MIN_BARS_ABOVE_SIGNAL > 0 else "off",
+        ",".join(sorted(EXCLUDE_SYMBOLS)) if EXCLUDE_SYMBOLS else "off",
     )
     logger.info(
         "Exit rules: HARD_STOP_PCT=%s (resting + polled)  30m>=%.1f%%  60m>=%.1f%%  MAX_HOLD=%dm",
