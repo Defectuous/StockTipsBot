@@ -40,6 +40,7 @@ Config (env vars or .env):
                                submitted as a resting broker-side stop
                                order at entry, same as SML2
   RUNNER_MAX_HOLD_MINUTES     force-sell after this many minutes        default: 25
+  RUNNER_FILL_TIMEOUT_SECONDS cancel buy if unfilled after this long    default: 180
   RUNNER_SLIPPAGE_PCT         buy limit-price buffer above ask          default: 2.0
   RUNNER_MAX_BUY_AMOUNT       max $ per trade, regardless of wallet     default: 250.00
                                math (RESERVE_PCT/MAX_POSITIONS sizing
@@ -154,6 +155,7 @@ PROFIT_LOCK_PCT  = float(os.getenv("PROFIT_LOCK_PCT",          "50"))
 TIGHT_STOP_PCT   = float(os.getenv("TIGHT_STOP_PCT",           "5"))
 RSI_EXIT_LEVEL   = float(os.getenv("RSI_EXIT_LEVEL",           "75"))
 MAX_HOLD_MINUTES = int(os.getenv("RUNNER_MAX_HOLD_MINUTES",    "25"))
+FILL_TIMEOUT_SECS = int(os.getenv("RUNNER_FILL_TIMEOUT_SECONDS", "180"))
 START_TIME_ET    = os.getenv("START_TIME_ET",                  "")
 STOP_BUY_TIME_ET = os.getenv("STOP_BUY_TIME_ET",               "")
 DUMP_TIME_ET     = os.getenv("DUMP_TIME_ET",                   "")
@@ -931,9 +933,9 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             continue
 
         # Stream-based fill wait — no poll loop
-        filled = _wait_for_fill(str(order.id), timeout=180)
+        filled = _wait_for_fill(str(order.id), timeout=FILL_TIMEOUT_SECS)
         if not filled:
-            logger.error("  %s order did not fill within 3 minutes -- cancelling", sym)
+            logger.error("  %s order did not fill within %ds -- cancelling", sym, FILL_TIMEOUT_SECS)
             if _trader:
                 _trader.cancel_order(str(order.id))
             continue
@@ -975,12 +977,20 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
                 logger.info("  STOP  %s  hard=-%.0f%% ($%.4f)  id=%s",
                             sym, HARD_STOP_PCT, hard_stop_price, hs_id)
             else:
-                logger.warning("  Hard stop-loss failed for %s — falling back to trailing stop", sym)
-                ts_order = trader.submit_trailing_stop(sym, fill_qty, TRAIL_PCT)
+                # Hard stop submits fail when price has already gapped through
+                # the target stop price between fill and submission (common on
+                # thin, fast-moving microcaps) — Alpaca rejects a fixed stop
+                # price that's no longer below the current market price. A
+                # trailing stop has no such constraint (it's relative, not
+                # fixed), so fall back to one sized at HARD_STOP_PCT rather
+                # than the looser TRAIL_PCT, to keep the same risk budget.
+                logger.warning("  Hard stop-loss failed for %s — falling back to trailing stop at %.0f%%",
+                                sym, HARD_STOP_PCT)
+                ts_order = trader.submit_trailing_stop(sym, fill_qty, HARD_STOP_PCT)
                 if ts_order:
                     ts_id = str(ts_order.id)
                     update_trailing_stop_order(pos_id, ts_id)
-                    logger.info("  STOP  %s  trail=%.0f%%  id=%s", sym, TRAIL_PCT, ts_id)
+                    logger.info("  STOP  %s  trail=%.0f%%  id=%s", sym, HARD_STOP_PCT, ts_id)
                 else:
                     logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
         else:

@@ -122,7 +122,7 @@ else:
     STOP_BUY_TIME_ET = _stop_buy_override
 DUMP_TIME_ET      = os.getenv("SML_DUMP_TIME_ET") or os.getenv("DUMP_TIME_ET", "")
 HARD_STOP_PCT      = float(os.getenv("HARD_STOP_PCT",        "0"))
-MAX_ENTRY_MOVE_PCT = float(os.getenv("MAX_ENTRY_MOVE_PCT",   "0"))
+MAX_ENTRY_MOVE_PCT = float(os.getenv("SML_MAX_ENTRY_MOVE_PCT") or os.getenv("MAX_ENTRY_MOVE_PCT", "0"))
 MAX_ATR            = float(os.getenv("MAX_ATR",              "0"))
 MAX_RVOL           = float(os.getenv("MAX_RVOL",             "0"))
 MIN_RVOL           = float(os.getenv("MIN_RVOL",             "2.0"))
