@@ -135,6 +135,9 @@ START_TIME_ET    = os.getenv("START_TIME_ET",                 "")
 STOP_BUY_TIME_ET = os.getenv("STOP_BUY_TIME_ET",             "")
 DUMP_TIME_ET     = os.getenv("DUMP_TIME_ET",                  "")
 HARD_STOP_PCT    = float(os.getenv("HARD_STOP_PCT",           "0"))
+ATR_STOP_MULT    = float(os.getenv("ATR_STOP_MULT",           "2.0"))   # stop distance = ATR_STOP_MULT x ATR, when ATR is available
+ATR_MIN_STOP_PCT = float(os.getenv("ATR_MIN_STOP_PCT",        "2.0"))   # floor — never let a low-ATR read produce a near-zero stop
+ATR_MAX_STOP_PCT = float(os.getenv("ATR_MAX_STOP_PCT",        "10.0"))  # ceiling — never let a high-ATR read blow the stop out past this
 MAX_ENTRY_MOVE_PCT = float(os.getenv("SML2_MAX_ENTRY_MOVE_PCT") or os.getenv("MAX_ENTRY_MOVE_PCT", "0"))
 MAX_ATR          = float(os.getenv("MAX_ATR",                 "0"))
 MAX_RVOL         = float(os.getenv("MAX_RVOL",                "0"))
@@ -391,6 +394,31 @@ def _compute_buy_amount() -> float:
         return 0.0
     deployable = wallet["day_start_balance"] * (1 - RESERVE_PCT / 100)
     return deployable / MAX_POSITIONS
+
+
+def _size_by_risk(base_amount: float, price: float, atr: Optional[float]) -> tuple[float, float]:
+    """
+    Convert the flat per-slot budget into a volatility-normalized position:
+    stop distance follows the stock's own ATR instead of a fixed %, and share
+    count is set so dollar risk (stop distance x shares) stays roughly
+    constant at what base_amount x HARD_STOP_PCT would have risked, rather
+    than dollar exposure being constant regardless of how far away the stop
+    has to sit. A tight/low-ATR stock gets a bigger position; a wide/volatile
+    one gets a smaller one. Falls back to the flat HARD_STOP_PCT/base_amount
+    behavior when ATR isn't available.
+
+    Bounds (ATR_MIN_STOP_PCT/ATR_MAX_STOP_PCT) keep the resulting stop —
+    and therefore the resulting position size, since they're inversely
+    related — from swinging too far off base_amount on a noisy ATR read.
+    """
+    if not atr or price <= 0 or HARD_STOP_PCT <= 0:
+        return base_amount, (HARD_STOP_PCT if HARD_STOP_PCT > 0 else TRAIL_PCT)
+
+    raw_stop_pct = ATR_STOP_MULT * atr / price * 100
+    stop_pct     = max(ATR_MIN_STOP_PCT, min(ATR_MAX_STOP_PCT, raw_stop_pct))
+    risk_dollars = base_amount * HARD_STOP_PCT / 100
+    sized_amount = risk_dollars * 100 / stop_pct
+    return sized_amount, stop_pct
 
 
 def _log_wallet() -> None:
@@ -846,12 +874,6 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
         if get_open_position_count(PROVIDER) >= MAX_POSITIONS:
             break
 
-        wallet    = get_wallet(SCREENER_ID)
-        available = wallet["current_balance"] - wallet["day_start_balance"] * RESERVE_PCT / 100
-        if available < buy_amount:
-            logger.info("  SKIP — depleted available cash after buying")
-            break
-
         sym = stock.symbol
 
         if sym in EXCLUDE_SYMBOLS:
@@ -893,14 +915,25 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             logger.info("  SKIP  %s — RVOL %.1fx > %.0fx max", sym, rvol_ta, MAX_RVOL)
             continue
 
+        # Sized last, once we know this candidate actually cleared every
+        # other gate — dollar risk stays ~constant across trades, share
+        # count flexes with the stock's own ATR instead of a flat budget.
+        sized_amount, stop_pct = _size_by_risk(buy_amount, stock.price, stock.atr)
+        wallet    = get_wallet(SCREENER_ID)
+        available = wallet["current_balance"] - wallet["day_start_balance"] * RESERVE_PCT / 100
+        if available < sized_amount:
+            logger.info("  SKIP  %s — depleted available cash (need $%.2f, have $%.2f)",
+                        sym, sized_amount, available)
+            continue
+
         logger.info(
             "  BUY   %s  $%.4f  RSI=%.1f  chg=%+.2f%% (min %.1f%%)  RVOL=%.1fx (min %.1fx)  "
-            "VWAP=%s  budget=$%.2f",
+            "VWAP=%s  budget=$%.2f  stop=-%.1f%% (ATR-sized)",
             sym, stock.price, stock.rsi, stock.change_pct, MIN_CHANGE_PCT, rvol_ta or 0.0,
-            MIN_RVOL, "ok" if stock.above_vwap else "fail", buy_amount,
+            MIN_RVOL, "ok" if stock.above_vwap else "fail", sized_amount, stop_pct,
         )
 
-        order, err = trader.buy_stock(sym, buy_amount, stock.price)
+        order, err = trader.buy_stock(sym, sized_amount, stock.price)
         if err:
             logger.error("  Buy failed for %s: %s", sym, err)
             if DISCORD_WEBHOOK and "insufficient buying power" not in err:
@@ -949,20 +982,23 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
         ts_id = None
         hs_id = None
         if HARD_STOP_PCT > 0:
-            hard_stop_price = fill_price * (1 - HARD_STOP_PCT / 100)
+            hard_stop_price = fill_price * (1 - stop_pct / 100)
             hs_order = trader.submit_stop_loss(sym, fill_qty, hard_stop_price)
             if hs_order:
                 hs_id = str(hs_order.id)
                 update_hard_stop_order(pos_id, hs_id)
-                logger.info("  STOP  %s  hard=-%.0f%% ($%.4f)  id=%s",
-                            sym, HARD_STOP_PCT, hard_stop_price, hs_id)
+                logger.info("  STOP  %s  hard=-%.1f%% ($%.4f)  id=%s",
+                            sym, stop_pct, hard_stop_price, hs_id)
             else:
-                logger.warning("  Hard stop-loss failed for %s — falling back to trailing stop", sym)
-                ts_order = trader.submit_trailing_stop(sym, fill_qty, TRAIL_PCT)
+                # Fall back to a trailing stop sized at the same stop_pct used
+                # to size the position, not the looser default TRAIL_PCT —
+                # keeps the fallback consistent with the risk that was budgeted.
+                logger.warning("  Hard stop-loss failed for %s — falling back to trailing stop at %.1f%%", sym, stop_pct)
+                ts_order = trader.submit_trailing_stop(sym, fill_qty, stop_pct)
                 if ts_order:
                     ts_id = str(ts_order.id)
                     update_trailing_stop_order(pos_id, ts_id)
-                    logger.info("  STOP  %s  trail=%.0f%%  id=%s", sym, TRAIL_PCT, ts_id)
+                    logger.info("  STOP  %s  trail=%.1f%%  id=%s", sym, stop_pct, ts_id)
                 else:
                     logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
                     if DISCORD_WEBHOOK:

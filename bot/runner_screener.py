@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass
 from typing import List, Optional
 
-from bot.market_data import _price_velocity_pct, _rvol_time_adjusted, _vwap
+from bot.market_data import _atr, _price_velocity_pct, _rvol_time_adjusted, _vwap
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,7 @@ class RunnerScreenedStock:
     vwap:                Optional[float]
     above_vwap:          bool
     last_bar_bullish:    bool
+    atr:                 Optional[float]
 
     @property
     def passes(self) -> bool:
@@ -77,6 +78,7 @@ def _analyze(
     rvol     = _rvol_time_adjusted(bars15, now_et)
     vwap_val = _vwap(bars1[-VWAP_WINDOW_MIN:])
     last_bar = bars1[-1]
+    atr_val  = _atr(bars1)   # 1-min ATR — used for risk-normalized stop/position sizing at entry
 
     return RunnerScreenedStock(
         symbol            = symbol,
@@ -87,4 +89,5 @@ def _analyze(
         vwap              = vwap_val,
         above_vwap        = (price > vwap_val) if vwap_val is not None else False,
         last_bar_bullish  = last_bar.close >= last_bar.open,
+        atr               = atr_val,
     )
