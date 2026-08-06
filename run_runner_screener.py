@@ -697,14 +697,34 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
             # check a stuck mismatch retries forever every monitor cycle.
             actual_qty = trader.get_position_qty(sym)
             if actual_qty <= 0:
+                # Broker holds 0 but the WS fill callback apparently never
+                # fired for us (missed/delayed event — confirmed to happen on
+                # 2026-08-05 for OPENW, whose real fill was $0.2802 vs. the
+                # $0.281 cached price this fallback would otherwise have used)
+                # — check whether either resting stop order actually shows
+                # filled and use its real fill price before falling back to
+                # the last cached price.
+                close_price = current_price
+                for oid in (stop_order_id, hard_stop_order_id):
+                    if not oid:
+                        continue
+                    try:
+                        order = trader.client.get_order_by_id(oid)
+                        if order.status.value == "filled" and order.filled_avg_price:
+                            close_price = float(order.filled_avg_price)
+                            break
+                    except Exception as e:
+                        logger.debug("Stop order lookup failed for %s (%s): %s", sym, oid, e)
                 logger.warning(
                     "  %s — DB shows %d shares open but broker holds 0; "
-                    "closing DB record at last known price (%s)",
-                    sym, shares, reason,
+                    "closing DB record at %s (%s)",
+                    sym, shares,
+                    "confirmed fill price" if close_price != current_price else "last known price",
+                    reason,
                 )
-                pnl = (current_price - buy_price) * shares
-                close_position(pos_id, current_price, datetime.now(timezone.utc), pnl)
-                update_wallet_cash(SCREENER_ID, current_price * shares)
+                pnl = (close_price - buy_price) * shares
+                close_position(pos_id, close_price, datetime.now(timezone.utc), pnl)
+                update_wallet_cash(SCREENER_ID, close_price * shares)
                 _unsubscribe_prices([sym])
                 return
 
@@ -956,9 +976,15 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
         sized_amount, stop_pct = _size_by_risk(buy_amount, stock.price, stock.atr)
         wallet    = get_wallet(SCREENER_ID)
         available = wallet["current_balance"] - wallet["day_start_balance"] * RESERVE_PCT / 100
-        if available < sized_amount:
+        # Cap to what's actually available rather than skipping outright — the
+        # risk-sized amount can exceed the flat base budget for a tight-stop
+        # (low-ATR) stock; take the largest position that still respects the
+        # ATR stop distance instead of discarding a qualifying trade because
+        # the risk-optimal size happened to be unaffordable.
+        sized_amount = min(sized_amount, available)
+        if sized_amount < stock.price:
             logger.info("  SKIP  %s — depleted available cash (need $%.2f, have $%.2f)",
-                        sym, sized_amount, available)
+                        sym, stock.price, available)
             continue
 
         logger.info(

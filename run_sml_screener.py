@@ -38,6 +38,12 @@ Config (env vars or .env):
   MIN_GAIN_AT_60M         exit if gain% below this by 60min held   default: 0.0
   MAX_ENTRY_MOVE_PCT      skip buys already up > this %            default: 0 (off)
   MAX_ATR                 skip buys with ATR above this            default: 0 (off)
+  MAX_VWAP_Z              skip buys this many stdevs above VWAP    default: 0 (off)
+                          or more — a high z-score means price has
+                          run up far from its volume-weighted mean
+                          for the session, which historically raises
+                          the odds of a pullback/reversal rather than
+                          continuation
   MAX_RVOL                skip buys with RVOL above this           default: 0 (off)
   MIN_RVOL                skip buys with RVOL below this           default: 2.0
   MIN_CHANGE_PCT          skip buys flat/red on the day below this default: 2.0
@@ -127,6 +133,7 @@ ATR_MIN_STOP_PCT   = float(os.getenv("ATR_MIN_STOP_PCT",     "2.0"))   # floor �
 ATR_MAX_STOP_PCT   = float(os.getenv("ATR_MAX_STOP_PCT",     "10.0"))  # ceiling — never let a high-ATR read blow the stop out past this
 MAX_ENTRY_MOVE_PCT = float(os.getenv("SML_MAX_ENTRY_MOVE_PCT") or os.getenv("MAX_ENTRY_MOVE_PCT", "0"))
 MAX_ATR            = float(os.getenv("MAX_ATR",              "0"))
+MAX_VWAP_Z         = float(os.getenv("MAX_VWAP_Z",           "0"))
 MAX_RVOL           = float(os.getenv("MAX_RVOL",             "0"))
 MIN_RVOL           = float(os.getenv("MIN_RVOL",             "2.0"))
 MIN_CHANGE_PCT     = float(os.getenv("MIN_CHANGE_PCT",        "2.0"))
@@ -577,6 +584,11 @@ def scan_and_trade(
                         sym, stock.atr, MAX_ATR)
             continue
 
+        if MAX_VWAP_Z > 0 and stock.vwap_z is not None and stock.vwap_z > MAX_VWAP_Z:
+            logger.info("  SKIP %s — %.2f stdevs above VWAP (limit %.1f) — overextended, elevated reversal risk",
+                        sym, stock.vwap_z, MAX_VWAP_Z)
+            continue
+
         if MIN_CHANGE_PCT > 0 and (stock.change_pct is None or stock.change_pct < MIN_CHANGE_PCT):
             logger.info("  SKIP %s — change %.2f%% < %.1f%% min", sym, stock.change_pct or 0.0, MIN_CHANGE_PCT)
             continue
@@ -600,16 +612,24 @@ def scan_and_trade(
         sized_amount, stop_pct = _size_by_risk(buy_amount, stock.price, stock.atr)
         wallet    = get_wallet(screener_id)
         available = wallet["current_balance"] - wallet["day_start_balance"] * RESERVE_PCT / 100
-        if available < sized_amount:
+        # Cap to what's actually available rather than skipping outright — the
+        # risk-sized amount can exceed the flat base budget for a tight-stop
+        # (low-ATR) stock; take the largest position that still respects the
+        # ATR stop distance instead of discarding a qualifying trade because
+        # the risk-optimal size happened to be unaffordable.
+        sized_amount = min(sized_amount, available)
+        if sized_amount < stock.price:
             logger.info("  SKIP %s — depleted available cash (need $%.2f, have $%.2f)",
-                        sym, sized_amount, available)
+                        sym, stock.price, available)
             continue
 
         logger.info(
             "  BUY  %s  $%.4f  RSI=%.1f  chg=%+.2f%% (min %.1f%%)  RVOL=%.1fx (min %.1fx)  "
-            "VWAP=%s  budget=$%.2f  stop=-%.1f%% (ATR-sized)",
+            "VWAP=%s (z=%s)  budget=$%.2f  stop=-%.1f%% (ATR-sized)",
             sym, stock.price, stock.rsi, stock.change_pct, MIN_CHANGE_PCT, rvol_ta or 0.0,
-            MIN_RVOL, "ok" if stock.above_vwap else "fail", sized_amount, stop_pct,
+            MIN_RVOL, "ok" if stock.above_vwap else "fail",
+            f"{stock.vwap_z:+.2f}" if stock.vwap_z is not None else "n/a",
+            sized_amount, stop_pct,
         )
 
         order, err = trader.buy_stock(sym, sized_amount, stock.price)
@@ -647,6 +667,7 @@ def scan_and_trade(
             change_pct_at_entry  = stock.change_pct,
             macd_crossover_fresh = stock.macd_crossover,
             rvol_at_entry        = round(rvol_ta, 3) if rvol_ta else None,
+            vwap_z_at_entry      = stock.vwap_z,
         )
 
         # Alpaca reserves the full share qty against the first resting sell
@@ -719,10 +740,11 @@ def main():
                     START_TIME_ET or "off", STOP_BUY_TIME_ET or "off", DUMP_TIME_ET or "off")
     logger.info(
         "Entry filters: MIN_RVOL=%.1fx  MAX_RVOL=%s  MIN_CHANGE_PCT=%.1f%%  "
-        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  MACD_MIN_BARS_ABOVE_SIGNAL=%s  EXCLUDE_SYMBOLS=%s",
+        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  MAX_VWAP_Z=%s  MACD_MIN_BARS_ABOVE_SIGNAL=%s  EXCLUDE_SYMBOLS=%s",
         MIN_RVOL, MAX_RVOL if MAX_RVOL > 0 else "off", MIN_CHANGE_PCT,
         MAX_ENTRY_MOVE_PCT if MAX_ENTRY_MOVE_PCT > 0 else "off",
         MAX_ATR if MAX_ATR > 0 else "off",
+        MAX_VWAP_Z if MAX_VWAP_Z > 0 else "off",
         MACD_MIN_BARS_ABOVE_SIGNAL if MACD_MIN_BARS_ABOVE_SIGNAL > 0 else "off",
         ",".join(sorted(EXCLUDE_SYMBOLS)) if EXCLUDE_SYMBOLS else "off",
     )

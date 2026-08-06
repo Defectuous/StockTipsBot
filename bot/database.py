@@ -51,7 +51,8 @@ def init_db():
                 atr_at_entry            REAL,
                 change_pct_at_entry     REAL,
                 macd_crossover_fresh    INTEGER,
-                rvol_at_entry           REAL
+                rvol_at_entry           REAL,
+                vwap_z_at_entry         REAL
             );
 
             CREATE TABLE IF NOT EXISTS price_bars (
@@ -84,6 +85,7 @@ def init_db():
             ("macd_crossover_fresh",  "INTEGER"),
             ("rvol_at_entry",         "REAL"),
             ("hard_stop_order_id",    "TEXT"),
+            ("vwap_z_at_entry",       "REAL"),
         ]
         for col, typedef in _migrations:
             try:
@@ -124,18 +126,19 @@ def save_position(
     change_pct_at_entry: Optional[float] = None,
     macd_crossover_fresh: Optional[bool] = None,
     rvol_at_entry: Optional[float] = None,
+    vwap_z_at_entry: Optional[float] = None,
 ) -> int:
     with _connect() as conn:
         cur = conn.execute(
             """INSERT INTO positions
                (symbol, provider, shares, buy_price, buy_time, buy_order_id,
                 rsi_at_entry, atr_at_entry, change_pct_at_entry,
-                macd_crossover_fresh, rvol_at_entry)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                macd_crossover_fresh, rvol_at_entry, vwap_z_at_entry)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (symbol, provider, shares, buy_price, buy_time.isoformat(), buy_order_id,
              rsi_at_entry, atr_at_entry, change_pct_at_entry,
              int(macd_crossover_fresh) if macd_crossover_fresh is not None else None,
-             rvol_at_entry),
+             rvol_at_entry, vwap_z_at_entry),
         )
         return cur.lastrowid
 

@@ -158,6 +158,25 @@ def _vwap(bars: list) -> Optional[float]:
     return round(total_pv / total_vol, 4)
 
 
+def _vwap_stdev(bars: list, vwap: float) -> Optional[float]:
+    """
+    Volume-weighted standard deviation of typical price around VWAP, over
+    the same bar set used to compute *vwap*. Used to express how far the
+    current price sits from VWAP in stdev units (see ScreenedStock.vwap_z)
+    rather than a flat percentage — a 3% move means something different on
+    a choppy stock than on a tight one.
+    """
+    total_vol = 0.0
+    weighted_sq_diff = 0.0
+    for b in bars:
+        tp = (b.high + b.low + b.close) / 3.0
+        total_vol += b.volume
+        weighted_sq_diff += b.volume * (tp - vwap) ** 2
+    if total_vol == 0:
+        return None
+    return round((weighted_sq_diff / total_vol) ** 0.5, 4)
+
+
 def _rvol_time_adjusted(bars15: list, now_et) -> Optional[float]:
     """
     Time-adjusted RVOL: today's cumulative volume from 9:30am ET to now vs

@@ -24,7 +24,7 @@ from alpaca.data import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-from bot.market_data import _atr, _macd_analysis, _rsi_series, _vwap
+from bot.market_data import _atr, _macd_analysis, _rsi_series, _vwap, _vwap_stdev
 from bot.trending import TrendingStock, get_trending
 
 logger = logging.getLogger(__name__)
@@ -52,6 +52,8 @@ class ScreenedStock:
     atr:                 Optional[float]
     vwap:                Optional[float]
     above_vwap:          bool
+    vwap_stdev:          Optional[float]
+    vwap_z:              Optional[float]
 
     @property
     def passes(self) -> bool:
@@ -91,7 +93,14 @@ def _analyze(
     closes_15m = [b.close for b in bars_15m]
     macd       = _macd_analysis(closes_15m)
     atr_val    = _atr(bars_5m)
-    vwap_val   = _vwap(vwap_bars if vwap_bars is not None else bars_5m)
+    vwap_bars_used = vwap_bars if vwap_bars is not None else bars_5m
+    vwap_val   = _vwap(vwap_bars_used)
+    vwap_stdev_val = _vwap_stdev(vwap_bars_used, vwap_val) if vwap_val is not None else None
+    vwap_z_val = (
+        round((price - vwap_val) / vwap_stdev_val, 2)
+        if vwap_val is not None and vwap_stdev_val
+        else None
+    )
 
     return ScreenedStock(
         symbol              = symbol,
@@ -106,6 +115,8 @@ def _analyze(
         atr                 = atr_val,
         vwap                = vwap_val,
         above_vwap          = (price > vwap_val) if vwap_val is not None else False,
+        vwap_stdev          = vwap_stdev_val,
+        vwap_z              = vwap_z_val,
     )
 
 
