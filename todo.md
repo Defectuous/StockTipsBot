@@ -46,3 +46,27 @@
 - [x] Modify `daily_report.py` to work with this project — rewritten 2026-08-08 to
       read sml.log/sml2.log (SKIP/BUY/FILLED/SOLD) + stockbot.db positions instead
       of the old pillar/catalyst JSON schema that never matched this codebase.
+
+## Logging — 2026-08-09
+
+- [x] **Cut logs at midnight instead of growing forever / getting overwritten
+      daily.** Added `bot/logging_utils.py:DailyFileHandler` (subclasses
+      `TimedRotatingFileHandler`) — active log file is named
+      `<prefix>.mmddyyyy` (e.g. `sml.log.08092026`) from the first line of
+      the day; rotation is checked on each log call, so the new file opens
+      lazily on the next logging event after local midnight, not via a
+      background timer. Wired into SML, SML2, RUNNER, and LIVE (all
+      non-archived screeners) via `configure_logging()`. Updated
+      `tools/explain_trading_day.py` (new `resolve_log_path()`),
+      `daily_report.py`, `tools/pull_day_candidates.py`, and
+      `tools/log_checkpoint_shadow.py` to resolve the dated file for a given
+      report date, falling back to the old flat name for pre-rotation logs.
+      `.gitignore` patterns updated to `*.log*` so rotated files stay
+      ignored. Tested: forced a simulated midnight rollover, confirmed
+      yesterday's file is left intact and a new dated file opens; ran
+      `explain_trading_day.py` and `daily_report.py` against real
+      `pi_data/` logs to confirm the flat-file fallback still works.
+      **Action item: the external process that syncs Pi logs into
+      `pi_data/` needs to pick up the new dated filenames (e.g. a glob
+      instead of one fixed name) for historical-day lookups to work — it
+      isn't part of this repo, so wasn't changed here.**

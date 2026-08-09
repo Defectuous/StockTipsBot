@@ -58,6 +58,18 @@ def _reason_bucket(reason: str) -> str:
     return reason
 
 
+def resolve_log_path(data_dir: Path, provider: str, report_date: date) -> Path:
+    """
+    Screener logs rotate at local midnight into '<provider>.log.mmddyyyy'
+    (see bot/logging_utils.DailyFileHandler). Prefer that dated file for
+    report_date; fall back to the old flat '<provider>.log' name for logs
+    synced before that change (or same-day logs from a process still
+    running pre-rotation code).
+    """
+    dated = data_dir / f"{provider}.log.{report_date:%m%d%Y}"
+    return dated if dated.exists() else data_dir / f"{provider}.log"
+
+
 def parse_log(path: Path) -> dict:
     scans = 0
     max_passing = 0
@@ -196,7 +208,7 @@ def main():
     print(f"Trading day report for {args.date}  (source: {data_dir})")
 
     for p in args.providers:
-        log_path = data_dir / f"{p}.log"
+        log_path = resolve_log_path(data_dir, p, args.date)
         log_data = parse_log(log_path) if log_path.exists() else None
         provider = provider_map.get(p, p.upper() + "_SCREENER")
         db_trades = fetch_db_trades(db_path, provider, args.date)

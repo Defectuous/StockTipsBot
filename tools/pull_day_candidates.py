@@ -6,8 +6,12 @@ every symbol actually traded over the last N days.
 Log mode (default, single day): a symbol counts as a green flag if it shows
 up in a SML/SML2 screener log as either a BUY or a SKIP line — both mean it
 passed the initial MACD+RSI screen, since candidates that never clear
-MACD+RSI aren't named individually in the log. Only works for "today", since
-pi_data/*.log gets overwritten daily — there's no rotated history.
+MACD+RSI aren't named individually in the log. Screener logs now rotate at
+local midnight into dated files (provider.log.mmddyyyy, see
+bot/logging_utils.py), so a given day's log is available as long as it (or
+its sync into --dir) hasn't been deleted — this is no longer limited to
+"today", provided the sync step that populates pi_data/ picks up the dated
+filenames rather than a single fixed name.
 
 Trade-history mode (--days N): screener logs don't persist past SKIP-level
 candidates, so for historical days the only symbol data available is what
@@ -42,6 +46,8 @@ from dotenv import load_dotenv
 from alpaca.data import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+from tools.explain_trading_day import resolve_log_path
 
 load_dotenv()
 
@@ -80,10 +86,10 @@ def find_traded_symbols_by_day(db_path: Path, providers: list[str], days: int) -
     return by_day
 
 
-def find_green_flag_symbols(data_dir: Path, providers: list[str]) -> set[str]:
+def find_green_flag_symbols(data_dir: Path, providers: list[str], report_date: date) -> set[str]:
     symbols: set[str] = set()
     for p in providers:
-        log_path = data_dir / f"{p}.log"
+        log_path = resolve_log_path(data_dir, p, report_date)
         if not log_path.exists():
             print(f"  (no log for {p} at {log_path})")
             continue
@@ -207,7 +213,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Finding green-flag symbols for {args.date} from {data_dir} ({', '.join(args.providers)})...")
-    symbols = find_green_flag_symbols(data_dir, args.providers)
+    symbols = find_green_flag_symbols(data_dir, args.providers, args.date)
     if not symbols:
         print("No candidate symbols found — nothing to pull.")
         return

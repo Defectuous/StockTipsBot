@@ -6,16 +6,16 @@ client_secret_220416644191-hh6oiqck8keq0np23q9p28sdt8dce9cb.apps.googleuserconte
 # Environment config
 .env
 
-# Bot runtime files
+# Bot runtime files (logs rotate daily into <name>.log.mmddyyyy, hence the *)
 stockbot.db
 stockbot.test.db
-stockbot.log
-sml.log
-sml2.log
-mid.log
-super.log
-live.log
-runner.log
+stockbot.log*
+sml.log*
+sml2.log*
+mid.log*
+super.log*
+live.log*
+runner.log*
 old.token.json
 pi_data/
 

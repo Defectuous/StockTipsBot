@@ -124,21 +124,14 @@ from bot.database import (
     update_wallet_cash,
 )
 from bot.discord_notify import send_alert, send_close, send_error
+from bot.logging_utils import configure_logging
 from bot.market_data import _rsi_series, estimate_entry_indicators
 from bot.most_active import get_tradable_asset_symbols, get_universe_snapshot
 from bot.runner_screener import RVOL_MIN, VELOCITY_MIN_PCT, _analyze
 from bot.trader import Trader
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("runner.log"),
-    ],
-)
+configure_logging("runner.log")
 logger = logging.getLogger(__name__)
 
 load_dotenv()

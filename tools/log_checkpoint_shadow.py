@@ -19,7 +19,7 @@ so it's safe to re-run.
 Usage:
     python tools/log_checkpoint_shadow.py                  # today
     python tools/log_checkpoint_shadow.py --date 2026-08-04
-    python tools/log_checkpoint_shadow.py --log-path runner.log
+    python tools/log_checkpoint_shadow.py --log-path runner.log.08042026
 """
 import argparse
 import csv
@@ -37,6 +37,8 @@ from dotenv import load_dotenv
 from alpaca.data import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+
+from tools.explain_trading_day import resolve_log_path
 
 load_dotenv()
 
@@ -65,9 +67,9 @@ FIELDS = [
 
 
 def find_exit_reasons(log_path: Path, d: date) -> dict[tuple[str, str], str]:
-    """Map (symbol, HH:MM:SS sell time) -> exit reason, scoped to lines whose
-    timestamp falls within the session that started most recently before/on
-    the target date (runner.log accumulates multiple days, never rotates)."""
+    """Map (symbol, HH:MM:SS sell time) -> exit reason. runner.log now
+    rotates at local midnight into one file per day (see
+    bot/logging_utils.py), so log_path should already be scoped to d."""
     if not log_path.exists():
         return {}
     reasons: dict[tuple[str, str], str] = {}
@@ -158,11 +160,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--date", type=date.fromisoformat, default=date.today())
     parser.add_argument("--db", default="stockbot.db")
-    parser.add_argument("--log-path", default="runner.log")
+    parser.add_argument("--log-path", default=None,
+                         help="default: resolved from --date via runner.log.mmddyyyy, "
+                              "falling back to a flat runner.log")
     args = parser.parse_args()
 
     db_path = _ROOT / args.db
-    log_path = _ROOT / args.log_path
+    log_path = (_ROOT / args.log_path) if args.log_path else resolve_log_path(_ROOT, "runner", args.date)
 
     trades = find_runner_trades(db_path, args.date)
     if not trades:

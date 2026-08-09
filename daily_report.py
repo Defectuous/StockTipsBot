@@ -30,13 +30,13 @@ import sqlite3
 import sys
 import webbrowser
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytz
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tools.explain_trading_day import parse_log
+from tools.explain_trading_day import parse_log, resolve_log_path
 
 ET = pytz.timezone("America/New_York")
 ROOT = Path(__file__).resolve().parent
@@ -221,7 +221,7 @@ def build_report(trade_date: str | None = None, data_dir: str = "pi_data",
     all_trades: list[dict] = []
     for key in providers:
         provider = PROVIDER_MAP.get(key, f"{key.upper()}_SCREENER")
-        log_path = base / f"{key}.log"
+        log_path = resolve_log_path(base, key, date.fromisoformat(trade_date))
         log_data = parse_log(log_path) if log_path.exists() else None
         positions = _fetch_positions(db_path, provider, trade_date)
         trades = _build_trades(key, positions, log_data["sells"] if log_data else [])
