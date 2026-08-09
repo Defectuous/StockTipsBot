@@ -346,10 +346,18 @@ def monitor_positions(
         # ── 2. Hard stop loss (poll fallback — the resting broker order from
         #      entry normally catches this first via the DB-sync check above;
         #      this only fires if that order was never placed or is missing) ──
-        if HARD_STOP_PCT > 0 and gain_pct <= -HARD_STOP_PCT:
-            logger.info("  HARD STOP %s  gain=%.2f%%  (limit=%.0f%%)", sym, gain_pct, HARD_STOP_PCT)
+        # Use this position's own ATR-derived stop distance (saved at entry)
+        # instead of the flat HARD_STOP_PCT config — a tight-stop position
+        # would otherwise ride past its real stop before this fallback fires,
+        # and a wide-stop position would get cut early, before its resting
+        # stop was ever reached. Falls back to the flat config value for
+        # positions saved before this column existed, or when sizing fell
+        # back to flat-% (no ATR available at entry).
+        effective_stop_pct = pos.get("stop_pct_at_entry") or HARD_STOP_PCT
+        if HARD_STOP_PCT > 0 and effective_stop_pct > 0 and gain_pct <= -effective_stop_pct:
+            logger.info("  HARD STOP %s  gain=%.2f%%  (limit=%.1f%%)", sym, gain_pct, effective_stop_pct)
             _exit_position(trader, screener_id, pos_id, sym, buy_price, shares,
-                            stop_order_id, hard_stop_order_id, f"Hard stop -{HARD_STOP_PCT:.0f}%")
+                            stop_order_id, hard_stop_order_id, f"Hard stop -{effective_stop_pct:.1f}%")
             continue
 
         # ── 3. Time exit — graduated checkpoints at 30/60min tighten the bar,
@@ -668,6 +676,7 @@ def scan_and_trade(
             macd_crossover_fresh = stock.macd_crossover,
             rvol_at_entry        = round(rvol_ta, 3) if rvol_ta else None,
             vwap_z_at_entry      = stock.vwap_z,
+            stop_pct_at_entry    = stop_pct,
         )
 
         # Alpaca reserves the full share qty against the first resting sell

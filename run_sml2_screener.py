@@ -687,9 +687,14 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
         # ── 1. Hard stop (poll fallback — the resting broker order from entry
         #      normally catches this instantly via a TradingStream fill event;
         #      this only fires if that order was never placed or is missing) ──
-        if HARD_STOP_PCT > 0 and gain_pct <= -HARD_STOP_PCT:
-            logger.info("  HARD STOP  %s  gain=%.2f%%", sym, gain_pct)
-            _sell_and_close(f"Hard stop -{HARD_STOP_PCT:.0f}%")
+        # Use this position's own ATR-derived stop distance (saved at entry)
+        # instead of the flat HARD_STOP_PCT config — see run_sml_screener.py
+        # for the full rationale. Falls back to the flat config value for
+        # positions saved before this column existed.
+        effective_stop_pct = pos.get("stop_pct_at_entry") or HARD_STOP_PCT
+        if HARD_STOP_PCT > 0 and effective_stop_pct > 0 and gain_pct <= -effective_stop_pct:
+            logger.info("  HARD STOP  %s  gain=%.2f%%  (limit=%.1f%%)", sym, gain_pct, effective_stop_pct)
+            _sell_and_close(f"Hard stop -{effective_stop_pct:.1f}%")
             continue
 
         # ── 2. Time exit — graduated checkpoints at 30/60min tighten the bar,
@@ -994,6 +999,7 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             change_pct_at_entry  = stock.change_pct,
             macd_crossover_fresh = stock.macd_crossover,
             rvol_at_entry        = round(rvol_ta, 3) if rvol_ta else None,
+            stop_pct_at_entry    = stop_pct,
         )
 
         # Alpaca reserves the full share qty against the first resting sell
