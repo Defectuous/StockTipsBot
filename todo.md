@@ -70,3 +70,58 @@
       `pi_data/` needs to pick up the new dated filenames (e.g. a glob
       instead of one fixed name) for historical-day lookups to work — it
       isn't part of this repo, so wasn't changed here.**
+
+## ZCMD loss review / early-exit research — 2026-08-09
+
+- [x] **Why did SML/SML2 both lose on ZCMD (2026-08-07)?** Both bought a
+      failed second bounce (price had already made a lower high vs. its
+      $1.19 pre-entry peak) and both were correctly cut by the existing
+      30-min checkpoint exit (-2.2%/-2.6%) rather than riding to the wider
+      hard stop — ZCMD kept sliding to ~$1.09-1.10 for the rest of the day,
+      so the checkpoint saved roughly half the loss vs. the counterfactual.
+      Conclusion: the exit side worked fine here; the entry is the weak link.
+
+- [x] **Checked "bought on a lower-high second bounce" as a general pattern**
+      across the 10 largest SML/SML2 losers vs. the 9 largest winners
+      (distance of entry price below the pre-entry intraday high). **Result:
+      not predictive** — winners buy just as far below the day's high as
+      losers do (e.g. HIVE -3.9%, INMB -4.9% off-high, both winners). This
+      is just the normal shape of an RSI-pullback entry, not a red flag.
+      **Don't build a filter on this** — no edge found.
+
+- [x] **Built `tools/vwap_reclaim_shadow.py`** — shadow-tests a candidate
+      early-exit rule ("exit if price closes back below VWAP") against all
+      103 closed SML/SML2 trades in `stockbot.db`, comparing hypothetical
+      vs. actual P&L. Not yet committed/pushed (working tree only).
+        - Naive version (any VWAP dip, 2-bar confirm): fires on 70/103
+          trades, way too trigger-happy — would have gutted real winners
+          incl. **OKLL (+9.94% -> -3.50%)**, BYAH, HIVE, BATL, OPEN.
+        - Gating on "must also be underwater vs. entry price" alone still
+          cut OKLL short (it genuinely dipped red+below-VWAP before its
+          big run).
+        - **Best tuned version found: require 8 consecutive 1-min closes
+          both below VWAP AND below entry price** before firing. Result:
+          fires on 42/103, 26 improved (avg +2.2%), only 13 hurt (avg
+          -1.0%, all near-flat trades, nothing like OKLL), just 1 real
+          winner nicked (+0.37% -> -1.5%). Net delta +43.9%, though ~26pts
+          of that is one outlier (TNMG, a stuck multi-day position from an
+          orphaned-fill bug, not a normal same-day fade) — net is still
+          positive (~+18% across the other 41 affected trades) excluding it.
+
+  **Next steps (not yet done):**
+  - [ ] **Decide whether to wire the tuned rule into `monitor_positions()`**
+        for SML/SML2 (dwell=8min, require-negative-gain=True), as an
+        additional exit check ahead of the existing 30-min checkpoint.
+  - [ ] Caveat to weigh before wiring it in: n=103 trades but SML/SML2
+        mostly trade the *same* symbol the same day, so this isn't 103
+        independent samples — and the dwell=8 parameter was picked by
+        looking at these same trades (in-sample). Worth validating against
+        a couple weeks of new live data before trusting it fully.
+  - [ ] Consider a couple of untested variants if dwell=8 alone doesn't feel
+        solid enough: a %-based VWAP buffer (e.g. close >0.3% below VWAP,
+        not just any close below) instead of/combined with the dwell count;
+        or splitting dwell down (6-7min) to see if more trades improve
+        without reintroducing winner-cutting.
+  - [ ] Commit `tools/vwap_reclaim_shadow.py` to git (currently untracked).
+  - [ ] `reports/vwap_reclaim_shadow.csv` has the full per-trade results if
+        you want to eyeball the "hurt"/"improved" lists yourself first.
