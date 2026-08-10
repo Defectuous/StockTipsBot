@@ -93,7 +93,7 @@ def running_vwap(bars: list) -> list[float]:
 
 
 def simulate_trade(bars: list, trade: dict, dwell: int, warmup_min: int,
-                    require_negative_gain: bool = False) -> dict | None:
+                    require_negative_gain: bool = False, vwap_buffer_pct: float = 0.0) -> dict | None:
     market_open = _ET.localize(
         datetime.combine(trade["buy_time"].astimezone(_ET).date(), datetime.min.time())
         .replace(hour=9, minute=30)
@@ -120,7 +120,7 @@ def simulate_trade(bars: list, trade: dict, dwell: int, warmup_min: int,
             break
         if b.timestamp < warmup_cutoff:
             continue
-        below_vwap = vwaps[i] is not None and b.close < vwaps[i]
+        below_vwap = vwaps[i] is not None and b.close < vwaps[i] * (1 - vwap_buffer_pct / 100)
         underwater = (not require_negative_gain) or b.close < trade["buy_price"]
         if below_vwap and underwater:
             below_streak += 1
@@ -153,6 +153,8 @@ def main():
                          help="ignore VWAP breaks in the first N minutes post-entry (default: 3)")
     parser.add_argument("--require-negative-gain", action="store_true",
                          help="only let the rule fire while price is below entry (can't cut a green trade)")
+    parser.add_argument("--vwap-buffer-pct", type=float, default=0.0,
+                         help="require close this many %% below VWAP to count as 'below' (default: 0.0, any close below)")
     parser.add_argument("--out", default="reports/vwap_reclaim_shadow.csv")
     parser.add_argument("--bar-cache", default=None,
                          help="pickle file to cache fetched 1-min bars across runs (speeds up parameter sweeps)")
@@ -192,7 +194,8 @@ def main():
         bars = bars_cache[key]
         if not bars:
             continue
-        res = simulate_trade(bars, t, args.dwell, args.warmup_min, args.require_negative_gain)
+        res = simulate_trade(bars, t, args.dwell, args.warmup_min, args.require_negative_gain,
+                              args.vwap_buffer_pct)
         if res:
             results.append(res)
 

@@ -108,20 +108,40 @@
           orphaned-fill bug, not a normal same-day fade) — net is still
           positive (~+18% across the other 41 affected trades) excluding it.
 
+  - [x] Committed `tools/vwap_reclaim_shadow.py` to git (`47e5fd3`).
+
+- [x] **Swept dwell and a new %-based VWAP-buffer variant** (added
+      `--vwap-buffer-pct` to the tool) to see if either beats the dwell=8
+      baseline. All runs use `--require-negative-gain`, cached 1-min bars
+      in `reports/_vwap_bar_cache.pkl`.
+        - **dwell=9 (no buffer) is strictly better than dwell=8**: fired
+          41/103 (vs 42), only 10 hurt (vs 13), net delta **+51.58%** (vs
+          +43.86%), and ex-TNMG-outlier net **+24.51%** (vs +17.93%) —
+          same single winner nicked either way. **New best-tuned
+          candidate: dwell=9.**
+        - dwell=5/6/7 (below 8) all reintroduce winner-cutting (4-5
+          winners cut vs. 1 at dwell=8/9) and worse hurt-trade averages —
+          confirms lower dwell is a strict downgrade, don't go below 8.
+        - dwell=10/12 (above 9) trend back down (+44.69%, +40.54%) — 9 is
+          a local peak, not just "higher is better."
+        - **%-based VWAP buffer variant does not help.** Tried
+          0.2%/0.3%/0.5% buffers at both dwell=8 and dwell=9 — all reduce
+          net delta vs. the unbuffered version at the same dwell (e.g.
+          dwell=9+0.3% buffer: net +40.25%, ex-TNMG +13.18%, both worse
+          than dwell=9 unbuffered). The buffer trims some hurt trades but
+          trims improved trades by more. **Don't add a VWAP buffer.**
+
   **Next steps (not yet done):**
   - [ ] **Decide whether to wire the tuned rule into `monitor_positions()`**
-        for SML/SML2 (dwell=8min, require-negative-gain=True), as an
-        additional exit check ahead of the existing 30-min checkpoint.
+        for SML/SML2 (dwell=9min, require-negative-gain=True, no VWAP
+        buffer), as an additional exit check ahead of the existing 30-min
+        checkpoint.
   - [ ] Caveat to weigh before wiring it in: n=103 trades but SML/SML2
         mostly trade the *same* symbol the same day, so this isn't 103
-        independent samples — and the dwell=8 parameter was picked by
-        looking at these same trades (in-sample). Worth validating against
-        a couple weeks of new live data before trusting it fully.
-  - [ ] Consider a couple of untested variants if dwell=8 alone doesn't feel
-        solid enough: a %-based VWAP buffer (e.g. close >0.3% below VWAP,
-        not just any close below) instead of/combined with the dwell count;
-        or splitting dwell down (6-7min) to see if more trades improve
-        without reintroducing winner-cutting.
-  - [ ] Commit `tools/vwap_reclaim_shadow.py` to git (currently untracked).
-  - [ ] `reports/vwap_reclaim_shadow.csv` has the full per-trade results if
-        you want to eyeball the "hurt"/"improved" lists yourself first.
+        independent samples — and dwell=9 was picked by looking at these
+        same trades (in-sample). Worth validating against a couple weeks
+        of new live data before trusting it fully.
+  - [ ] `reports/vwap_reclaim_shadow.csv` has the full per-trade results
+        (and `reports/vwap_reclaim_dwell{5,6,7,8,9,10,12}.csv` /
+        `vwap_reclaim_d{8,9}_b{0.2,0.3,0.5}.csv` for the sweep) if you
+        want to eyeball the "hurt"/"improved" lists yourself first.
