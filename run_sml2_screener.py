@@ -41,6 +41,12 @@ Config (env vars or .env):
                           stop order at entry, not just polled
   MIN_GAIN_AT_30M         exit if gain% below this by 30min held   default: -2.0
   MIN_GAIN_AT_60M         exit if gain% below this by 60min held   default: 0.0
+  VWAP_RECLAIM_DWELL_MIN  exit if price closes below both VWAP and default: 9 (0 = off)
+                          entry price for this many consecutive
+                          1-min bars (tuned via
+                          tools/vwap_reclaim_shadow.py, see todo.md)
+  VWAP_RECLAIM_WARMUP_MIN ignore VWAP-reclaim breaks in first N     default: 3
+                          minutes post-entry
   MAX_ENTRY_MOVE_PCT      skip buys already up > this %            default: 0 (off)
                           override with SML2_MAX_ENTRY_MOVE_PCT
   MAX_ATR                 skip buys with ATR above this            default: 0 (off)
@@ -97,7 +103,7 @@ from bot.database import (
 )
 from bot.discord_notify import send_alert, send_close, send_error
 from bot.logging_utils import configure_logging
-from bot.market_data import _rsi_series, _rvol_time_adjusted, estimate_entry_indicators
+from bot.market_data import _rsi_series, _rvol_time_adjusted, estimate_entry_indicators, vwap_reclaim_exit_price
 from bot.most_active import get_most_active_penny_stocks
 from bot.screener import _analyze
 from bot.trader import Trader
@@ -144,10 +150,13 @@ MACD_MIN_BARS_ABOVE_SIGNAL = int(
 )
 MIN_GAIN_AT_30M  = float(os.getenv("MIN_GAIN_AT_30M",          "-2.0"))
 MIN_GAIN_AT_60M  = float(os.getenv("MIN_GAIN_AT_60M",          "0.0"))
+VWAP_RECLAIM_DWELL_MIN  = int(os.getenv("VWAP_RECLAIM_DWELL_MIN",  "9"))  # 0 = off
+VWAP_RECLAIM_WARMUP_MIN = int(os.getenv("VWAP_RECLAIM_WARMUP_MIN", "3"))
 EXCLUDE_SYMBOLS  = {s.strip().upper() for s in os.getenv("EXCLUDE_SYMBOLS", "").split(",") if s.strip()}
 
 PROVIDER = f"{SCREENER_ID}_SCREENER"
 
+_1MIN  = TimeFrame(1,  TimeFrameUnit.Minute)
 _5MIN  = TimeFrame(5,  TimeFrameUnit.Minute)
 _15MIN = TimeFrame(15, TimeFrameUnit.Minute)
 
@@ -588,6 +597,22 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
         logger.warning("Monitor bars failed: %s", e)
         bars5 = {}
 
+    # Market-open-anchored 1-min bars for the VWAP-reclaim exit — needs the
+    # full-session running VWAP, not a rolling lookback.
+    bars1 = {}
+    if VWAP_RECLAIM_DWELL_MIN > 0:
+        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0).astimezone(pytz.UTC)
+        try:
+            bars1 = data_client.get_stock_bars(StockBarsRequest(
+                symbol_or_symbols=symbols,
+                timeframe=_1MIN,
+                start=market_open,
+                end=now,
+            )).data
+        except Exception as e:
+            logger.warning("VWAP-reclaim bar fetch failed: %s", e)
+            bars1 = {}
+
     for pos in positions:
         sym                = pos["symbol"]
         pos_id             = pos["id"]
@@ -690,11 +715,30 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
             _sell_and_close(f"Hard stop -{effective_stop_pct:.1f}%")
             continue
 
-        # ── 2. Time exit — graduated checkpoints at 30/60min tighten the bar,
+        # ── 2. VWAP-reclaim exit — cuts a fading thesis before the 30-min
+        #      checkpoint gets a chance to. Fires only while underwater vs.
+        #      entry, so it can't nick a still-green trade dipping below
+        #      VWAP; see bot/market_data.py:vwap_reclaim_exit_price for the
+        #      tuned dwell/warmup rationale. ────────────────────────────────
+        buy_dt = datetime.fromisoformat(pos["buy_time"])
+        if VWAP_RECLAIM_DWELL_MIN > 0:
+            sym_bars1 = list(bars1.get(sym, []))
+            break_price = vwap_reclaim_exit_price(
+                sym_bars1, buy_dt, buy_price,
+                VWAP_RECLAIM_DWELL_MIN, VWAP_RECLAIM_WARMUP_MIN,
+            )
+            if break_price is not None:
+                logger.info(
+                    "  VWAP RECLAIM EXIT  %s  %d consecutive 1-min closes below VWAP+entry  gain=%+.1f%%",
+                    sym, VWAP_RECLAIM_DWELL_MIN, gain_pct,
+                )
+                _sell_and_close("VWAP-reclaim exit")
+                continue
+
+        # ── 3. Time exit — graduated checkpoints at 30/60min tighten the bar,
         #      MAX_HOLD_MINUTES is the unconditional final cutoff. This closes
         #      the gap where a position drifts down 3-5% for the full hold
         #      window without ever tripping the trailing or hard stop. ──────
-        buy_dt   = datetime.fromisoformat(pos["buy_time"])
         held_min = (now - buy_dt).total_seconds() / 60
         if held_min >= MAX_HOLD_MINUTES:
             logger.info("  TIME EXIT  %s  held %.0fm  gain=%+.1f%%  (max hold)", sym, held_min, gain_pct)
@@ -711,7 +755,7 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
             _sell_and_close("30-min checkpoint exit")
             continue
 
-        # ── 3. Dump time ──────────────────────────────────────────────────────
+        # ── 4. Dump time ──────────────────────────────────────────────────────
         if DUMP_TIME_ET:
             dump_h, dump_m = map(int, DUMP_TIME_ET.split(":"))
             if (now_et.hour, now_et.minute) >= (dump_h, dump_m):
@@ -719,7 +763,7 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
                 _sell_and_close(f"Dump time {DUMP_TIME_ET} ET")
                 continue
 
-        # ── 4. RSI exit ───────────────────────────────────────────────────────
+        # ── 5. RSI exit ───────────────────────────────────────────────────────
         sym_bars = list(bars5.get(sym, []))
         if len(sym_bars) >= 20:
             closes   = [b.close for b in sym_bars]
@@ -735,7 +779,7 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
                     _sell_and_close("RSI overbought exit")
                     continue
 
-        # ── 5. Profit lock ────────────────────────────────────────────────────
+        # ── 6. Profit lock ────────────────────────────────────────────────────
         if not stop_tightened and gain_pct >= PROFIT_LOCK_PCT:
             # Whichever stop type is currently resting (trailing or hard —
             # they're mutually exclusive, see entry logic) gets cancelled and

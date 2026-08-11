@@ -177,6 +177,56 @@ def _vwap_stdev(bars: list, vwap: float) -> Optional[float]:
     return round((weighted_sq_diff / total_vol) ** 0.5, 4)
 
 
+def vwap_reclaim_exit_price(
+    bars1: List, buy_time: datetime, buy_price: float,
+    dwell: int, warmup_min: int,
+) -> Optional[float]:
+    """
+    Early-exit check: fires when price closes below BOTH the running VWAP and
+    entry price for `dwell` consecutive 1-min bars, ignoring the first
+    `warmup_min` minutes post-entry (normal post-fill wobble). Returns the
+    triggering close price, or None if the rule hasn't fired.
+
+    bars1 must be ascending 1-min bars anchored to market open (09:30 ET) so
+    the running VWAP matches the session VWAP entries were screened against
+    (see ScreenedStock.above_vwap in bot/screener.py). "Below VWAP" alone
+    isn't a real thesis break here since entries already require price above
+    VWAP -- underwater-vs-entry is layered on because a trade can dip below
+    VWAP while still green and that's not a fade worth cutting.
+
+    Tuned via tools/vwap_reclaim_shadow.py against 103 closed SML/SML2
+    trades: dwell=9 beat dwell=8 (net +51.6% vs +43.9% P&L-delta, fewer hurt
+    trades), dwell<8 reintroduces winner-cutting, and a %-based VWAP buffer
+    never improved results at any dwell -- see todo.md for the full sweep.
+    """
+    if not bars1 or dwell <= 0:
+        return None
+
+    vwaps: List[Optional[float]] = []
+    total_pv = 0.0
+    total_vol = 0.0
+    for b in bars1:
+        tp = (b.high + b.low + b.close) / 3.0
+        total_pv += tp * b.volume
+        total_vol += b.volume
+        vwaps.append(total_pv / total_vol if total_vol else None)
+
+    warmup_cutoff = buy_time + timedelta(minutes=warmup_min)
+    below_streak = 0
+    for b, vwap in zip(bars1, vwaps):
+        if b.timestamp < buy_time or b.timestamp < warmup_cutoff:
+            continue
+        below_vwap = vwap is not None and b.close < vwap
+        underwater = b.close < buy_price
+        if below_vwap and underwater:
+            below_streak += 1
+            if below_streak >= dwell:
+                return b.close
+        else:
+            below_streak = 0
+    return None
+
+
 def _rvol_time_adjusted(bars15: list, now_et) -> Optional[float]:
     """
     Time-adjusted RVOL: today's cumulative volume from 9:30am ET to now vs

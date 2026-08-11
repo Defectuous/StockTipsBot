@@ -131,16 +131,30 @@
           than dwell=9 unbuffered). The buffer trims some hurt trades but
           trims improved trades by more. **Don't add a VWAP buffer.**
 
-  **Next steps (not yet done):**
-  - [ ] **Decide whether to wire the tuned rule into `monitor_positions()`**
-        for SML/SML2 (dwell=9min, require-negative-gain=True, no VWAP
-        buffer), as an additional exit check ahead of the existing 30-min
-        checkpoint.
-  - [ ] Caveat to weigh before wiring it in: n=103 trades but SML/SML2
-        mostly trade the *same* symbol the same day, so this isn't 103
-        independent samples — and dwell=9 was picked by looking at these
-        same trades (in-sample). Worth validating against a couple weeks
-        of new live data before trusting it fully.
+- [x] **Wired the tuned rule into `monitor_positions()` for both SML and
+      SML2** (2026-08-11) — new `vwap_reclaim_exit_price()` helper in
+      `bot/market_data.py`, shared by both screeners. Fetches market-open-
+      anchored 1-min bars per monitor cycle (only when
+      `VWAP_RECLAIM_DWELL_MIN > 0`, so it costs nothing when disabled), and
+      checks each open position for `VWAP_RECLAIM_DWELL_MIN` (default 9)
+      consecutive 1-min closes below both the running VWAP and entry price,
+      ignoring the first `VWAP_RECLAIM_WARMUP_MIN` (default 3) minutes
+      post-entry. Sits as a new step ahead of the 30/60-min checkpoints in
+      both `monitor_positions()` functions (step 3 in SML, step 2 in SML2 —
+      SML2 already runs hard-stop first). require-negative-gain and no
+      buffer are hardcoded (not exposed as env vars) since the sweep found
+      no case where either helped. Unit-tested the helper against synthetic
+      bar sequences (sustained dip fires, still-green never fires, dip
+      shorter than dwell doesn't fire, alternating dip/recover resets the
+      streak) — all passed. Both screener modules import clean.
+
+  **Caveat carried into live use:** n=103 trades but SML/SML2 mostly trade
+  the *same* symbol the same day, so this isn't 103 independent samples —
+  and dwell=9 was picked by looking at these same trades (in-sample).
+  **Action item: watch the first 1-2 weeks of live `VWAP RECLAIM EXIT` log
+  lines closely** (which symbols, how often, whether any look like a winner
+  cut short) before trusting the tuned dwell fully — can be disabled per-
+  screener any time via `VWAP_RECLAIM_DWELL_MIN=0`.
   - [ ] `reports/vwap_reclaim_shadow.csv` has the full per-trade results
         (and `reports/vwap_reclaim_dwell{5,6,7,8,9,10,12}.csv` /
         `vwap_reclaim_d{8,9}_b{0.2,0.3,0.5}.csv` for the sweep) if you
