@@ -31,6 +31,11 @@ Config (env vars or .env):
                           override with SML_STOP_BUY_TIME_ET (use "off" to disable)
   DUMP_TIME_ET            force-sell all at clock time ET          default: "" (off)
                           override with SML_DUMP_TIME_ET
+  MIN_MINUTES_TO_DUMP     no new buys within this many minutes of   default: 0 (off)
+                          DUMP_TIME_ET — added 2026-08-14 after a
+                          DXF entry at 15:19 got force-closed by the
+                          15:30 dump rule 11 min later for a small
+                          loss with no chance to develop
   HARD_STOP_PCT           hard stop loss % from entry              default: 0 (off)
                           also submitted as a resting broker-side
                           stop order at entry, not just polled
@@ -126,6 +131,7 @@ elif _stop_buy_override.lower() == "off":
 else:
     STOP_BUY_TIME_ET = _stop_buy_override
 DUMP_TIME_ET      = os.getenv("SML_DUMP_TIME_ET") or os.getenv("DUMP_TIME_ET", "")
+MIN_MINUTES_TO_DUMP = int(os.getenv("SML_MIN_MINUTES_TO_DUMP") or os.getenv("MIN_MINUTES_TO_DUMP", "0"))
 HARD_STOP_PCT      = float(os.getenv("HARD_STOP_PCT",        "0"))
 ATR_STOP_MULT      = float(os.getenv("ATR_STOP_MULT",        "2.0"))   # stop distance = ATR_STOP_MULT x ATR, when ATR is available
 ATR_MIN_STOP_PCT   = float(os.getenv("ATR_MIN_STOP_PCT",     "2.0"))   # floor — never let a low-ATR read produce a near-zero stop
@@ -494,6 +500,15 @@ def scan_and_trade(
             logger.info("[%s] Past buy cutoff %s ET — no new buys", ts, STOP_BUY_TIME_ET)
             return
 
+    if DUMP_TIME_ET and MIN_MINUTES_TO_DUMP > 0:
+        dump_h, dump_m = map(int, DUMP_TIME_ET.split(":"))
+        dump_dt = now_et.replace(hour=dump_h, minute=dump_m, second=0, microsecond=0)
+        mins_to_dump = (dump_dt - now_et).total_seconds() / 60
+        if 0 <= mins_to_dump < MIN_MINUTES_TO_DUMP:
+            logger.info("[%s] %.0f min to dump time %s ET, need %d — no new buys",
+                        ts, mins_to_dump, DUMP_TIME_ET, MIN_MINUTES_TO_DUMP)
+            return
+
     # ── Position cap check ────────────────────────────────────────────────────
     open_count = get_open_position_count(provider)
     if open_count >= MAX_POSITIONS:
@@ -786,8 +801,9 @@ def main():
                 mode, MAX_POSITIONS, RESERVE_PCT, TRAIL_PCT, PROFIT_LOCK_PCT, TIGHT_STOP_PCT, RSI_EXIT_LEVEL)
     logger.info("Cooldown: %ds | Interval: %ds", COOLDOWN_SECS, SCAN_INTERVAL)
     if START_TIME_ET or STOP_BUY_TIME_ET or DUMP_TIME_ET:
-        logger.info("Window: start=%s  stop_buy=%s  dump=%s ET",
-                    START_TIME_ET or "off", STOP_BUY_TIME_ET or "off", DUMP_TIME_ET or "off")
+        logger.info("Window: start=%s  stop_buy=%s  dump=%s ET  min_min_to_dump=%s",
+                    START_TIME_ET or "off", STOP_BUY_TIME_ET or "off", DUMP_TIME_ET or "off",
+                    MIN_MINUTES_TO_DUMP or "off")
     logger.info(
         "Entry filters: MIN_RVOL=%.1fx  MAX_RVOL=%s  MIN_CHANGE_PCT=%.1f%%  "
         "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  MAX_VWAP_Z=%s  MACD_MIN_BARS_ABOVE_SIGNAL=%s  EXCLUDE_SYMBOLS=%s",

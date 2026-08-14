@@ -159,3 +159,60 @@
         (and `reports/vwap_reclaim_dwell{5,6,7,8,9,10,12}.csv` /
         `vwap_reclaim_d{8,9}_b{0.2,0.3,0.5}.csv` for the sweep) if you
         want to eyeball the "hurt"/"improved" lists yourself first.
+
+## Code review of the VWAP-reclaim live wire-in (`cb24063`) — 2026-08-12
+
+- [ ] **`vwap_reclaim_exit_price()` can complete its dwell=9 streak on the
+      current, still-forming 1-min bar, not a settled close.**
+      `bot/market_data.py:216` — `bars1` is fetched with `end=now`
+      (`run_sml_screener.py:307-312`, `run_sml2_screener.py:606-611`), so the
+      last bar in the series covers the in-progress minute; its close is
+      just the latest trade tick. If a position already has 8 consecutive
+      *closed* bars below VWAP+entry, that noisy partial bar can complete
+      the streak and fire the exit a bar early on a sub-minute wiggle —
+      `tools/vwap_reclaim_shadow.py` only ever evaluated fully-closed
+      historical bars, so this live edge case wasn't part of what dwell=9
+      was tuned/validated against. Fix: drop the final bar from `bars1`
+      when its timestamp falls in the current, not-yet-elapsed minute.
+
+- [ ] **Unguarded naive-vs-aware datetime comparison could abort a whole
+      monitor cycle.** `run_sml_screener.py:389` / `run_sml2_screener.py:723`
+      — `buy_dt = datetime.fromisoformat(pos["buy_time"])` is compared
+      against tz-aware Alpaca bar timestamps in `bot/market_data.py:217`
+      with no tzinfo normalization. `tools/backfill_entry_stats.py:206-208`
+      defensively normalizes naive `buy_time` rows with `pytz.UTC`, which
+      proves such rows have existed in this DB before. If
+      `monitor_positions()` ever hits one, the comparison raises
+      `TypeError` and — since the position loop has no try/except — every
+      position after the bad one goes unchecked that cycle (hard stop, time
+      exit, RSI, all skipped). Pre-existing risk (the older
+      `held_min = (now - buy_dt)` subtraction has the same exposure), not
+      introduced by this commit, but this commit is the first place in the
+      checkpoint chain to hit it and it's still unguarded. Low likelihood
+      today since every current write path
+      (`run_sml_screener.py:712`, `run_sml2_screener.py:1032`, `trade.py:73`,
+      `run_live_screener.py:503`) uses `datetime.now(timezone.utc)` or
+      Alpaca's `filled_at`, both tz-aware. Cheap fix: normalize `buy_dt`
+      tzinfo right after parsing, same as `backfill_entry_stats.py` does.
+
+- [ ] (minor, efficiency) **VWAP-reclaim doubles uncached REST bar-fetches
+      per monitor cycle.** `run_sml_screener.py:301-315` /
+      `run_sml2_screener.py:602-614` — `bars1` (session-anchored 1-min, for
+      VWAP-reclaim) is fetched separately from the existing `bars5` (for
+      RSI) every 30-60s cycle, and re-pulls the *entire* growing session
+      from 09:30 every time instead of caching and appending deltas —
+      payload grows to ~390 bars/symbol/cycle by day's end. A failed fetch
+      falls back to `bars1={}` with only a warning log, silently disabling
+      the exit for that cycle with no alert distinct from "condition not
+      met." Worth weighing given the added load per open position per
+      cycle, but not a correctness bug.
+
+- [x] (minor, cleanup) Dead clause in the warmup filter —
+      `bot/market_data.py:217`: `b.timestamp < buy_time` is always subsumed
+      by `b.timestamp < warmup_cutoff` for the non-negative
+      `VWAP_RECLAIM_WARMUP_MIN` this is actually configured with. Harmless
+      today; only matters if `warmup_min` were ever misconfigured negative.
+      **Ruled out as a real issue:** checked whether the shadow-test sweep
+      that picked dwell=9 used a different `--require-negative-gain`
+      setting than what's hardcoded live — both always require underwater
+      vs. entry, so no mismatch there.
