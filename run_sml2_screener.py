@@ -35,6 +35,7 @@ Config (env vars or .env):
   MAX_HOLD_MINUTES        force-sell after this many min           default: 120
   START_TIME_ET           don't scan before this time ET           default: "" (off)
   STOP_BUY_TIME_ET        stop new buys after this time ET         default: "" (off)
+                          override with SML2_STOP_BUY_TIME_ET (use "off" to disable) — added 2026-08-17
   DUMP_TIME_ET            force-sell all at clock time ET          default: "" (off)
   MIN_MINUTES_TO_DUMP     no new buys within this many minutes of   default: 0 (off)
                           DUMP_TIME_ET — added 2026-08-14, see
@@ -134,7 +135,13 @@ TIGHT_STOP_PCT   = float(os.getenv("TIGHT_STOP_PCT",          "5"))
 RSI_EXIT_LEVEL   = float(os.getenv("RSI_EXIT_LEVEL",          "75"))
 MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES",          "120"))
 START_TIME_ET    = os.getenv("START_TIME_ET",                 "")
-STOP_BUY_TIME_ET = os.getenv("STOP_BUY_TIME_ET",             "")
+_stop_buy_override = os.getenv("SML2_STOP_BUY_TIME_ET")
+if _stop_buy_override is None:
+    STOP_BUY_TIME_ET = os.getenv("STOP_BUY_TIME_ET", "")
+elif _stop_buy_override.lower() == "off":
+    STOP_BUY_TIME_ET = ""
+else:
+    STOP_BUY_TIME_ET = _stop_buy_override
 DUMP_TIME_ET     = os.getenv("DUMP_TIME_ET",                  "")
 MIN_MINUTES_TO_DUMP = int(os.getenv("SML2_MIN_MINUTES_TO_DUMP") or os.getenv("MIN_MINUTES_TO_DUMP", "0"))
 HARD_STOP_PCT    = float(os.getenv("HARD_STOP_PCT",           "0"))
@@ -725,11 +732,13 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
         #      VWAP; see bot/market_data.py:vwap_reclaim_exit_price for the
         #      tuned dwell/warmup rationale. ────────────────────────────────
         buy_dt = datetime.fromisoformat(pos["buy_time"])
+        if buy_dt.tzinfo is None:
+            buy_dt = buy_dt.replace(tzinfo=timezone.utc)
         if VWAP_RECLAIM_DWELL_MIN > 0:
             sym_bars1 = list(bars1.get(sym, []))
             break_price = vwap_reclaim_exit_price(
                 sym_bars1, buy_dt, buy_price,
-                VWAP_RECLAIM_DWELL_MIN, VWAP_RECLAIM_WARMUP_MIN,
+                VWAP_RECLAIM_DWELL_MIN, VWAP_RECLAIM_WARMUP_MIN, now=now,
             )
             if break_price is not None:
                 logger.info(
@@ -908,11 +917,20 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
         logger.warning("VWAP bar fetch failed: %s", e)
         bars5_vwap = {}
 
+    # Midnight-anchored, not "now minus 3 days" — see run_sml_screener.py for
+    # the full rationale. A fetch pinned to now's exact wall-clock time only
+    # ever captures the earliest day in the window from that clock-time
+    # onward, so on Monday (or the day after any holiday) Friday's
+    # early-session bars never get fetched at all, avg_prior comes back 0,
+    # and RVOL silently returns None all day.
+    rvol_lookback_start = (now_et - timedelta(days=7)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).astimezone(pytz.UTC)
     try:
         bars15 = data_client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=symbols,
             timeframe=_15MIN,
-            start=now - timedelta(days=3),
+            start=rvol_lookback_start,
             end=now,
         )).data
     except Exception as e:
@@ -980,9 +998,12 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
                         sym, stock.macd_bars_above_signal, MACD_MIN_BARS_ABOVE_SIGNAL)
             continue
 
-        rvol_ta = _rvol_time_adjusted(list(bars15.get(sym, [])), now_et)
+        rvol_ta = _rvol_time_adjusted(list(bars15.get(sym, [])), now_et, symbol=sym)
         if MIN_RVOL > 0 and (rvol_ta is None or rvol_ta < MIN_RVOL):
-            logger.info("  SKIP  %s — RVOL %.1fx < %.1fx min", sym, rvol_ta or 0.0, MIN_RVOL)
+            if rvol_ta is None:
+                logger.info("  SKIP  %s — RVOL unavailable (no bar data) < %.1fx min", sym, MIN_RVOL)
+            else:
+                logger.info("  SKIP  %s — RVOL %.1fx < %.1fx min", sym, rvol_ta, MIN_RVOL)
             continue
         if MAX_RVOL > 0 and rvol_ta and rvol_ta > MAX_RVOL:
             logger.info("  SKIP  %s — RVOL %.1fx > %.0fx max", sym, rvol_ta, MAX_RVOL)

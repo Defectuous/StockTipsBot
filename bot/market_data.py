@@ -179,13 +179,20 @@ def _vwap_stdev(bars: list, vwap: float) -> Optional[float]:
 
 def vwap_reclaim_exit_price(
     bars1: List, buy_time: datetime, buy_price: float,
-    dwell: int, warmup_min: int,
+    dwell: int, warmup_min: int, now: Optional[datetime] = None,
 ) -> Optional[float]:
     """
     Early-exit check: fires when price closes below BOTH the running VWAP and
     entry price for `dwell` consecutive 1-min bars, ignoring the first
     `warmup_min` minutes post-entry (normal post-fill wobble). Returns the
     triggering close price, or None if the rule hasn't fired.
+
+    `now`, if given, drops a trailing bar whose minute hasn't fully elapsed
+    yet — bars1 is fetched with end=now, so the last bar can be a
+    still-forming partial (close = latest trade tick, not a settled close);
+    without this it could complete the dwell streak a bar early on a
+    sub-minute wiggle that was never actually part of the tuned rule (see
+    tools/vwap_reclaim_shadow.py, which only ever evaluated closed bars).
 
     bars1 must be ascending 1-min bars anchored to market open (09:30 ET) so
     the running VWAP matches the session VWAP entries were screened against
@@ -201,6 +208,11 @@ def vwap_reclaim_exit_price(
     """
     if not bars1 or dwell <= 0:
         return None
+
+    if now is not None and bars1[-1].timestamp + timedelta(minutes=1) > now:
+        bars1 = bars1[:-1]
+        if not bars1:
+            return None
 
     vwaps: List[Optional[float]] = []
     total_pv = 0.0
@@ -227,10 +239,15 @@ def vwap_reclaim_exit_price(
     return None
 
 
-def _rvol_time_adjusted(bars15: list, now_et) -> Optional[float]:
+def _rvol_time_adjusted(bars15: list, now_et, symbol: str = "") -> Optional[float]:
     """
     Time-adjusted RVOL: today's cumulative volume from 9:30am ET to now vs
     the average of the same window on prior trading days in the 15-min bars.
+
+    Returns None when there isn't enough bar history to compute a real
+    ratio — distinct from a genuine 0.0x. Logs which specific case it hit
+    at DEBUG so a "RVOL unavailable" skip can be told apart from a
+    legitimately dead stock (see todo.md RVOL None-vs-0.0x bug).
     """
     et_tz    = pytz.timezone("America/New_York")
     open_min = 9 * 60 + 30  # 9:30am in minutes since midnight
@@ -248,15 +265,24 @@ def _rvol_time_adjusted(bars15: list, now_et) -> Optional[float]:
         by_day[bar_date] += b.volume
 
     if today not in by_day:
+        logger.debug(
+            "RVOL %s: no 15-min bars for today (%s) in window yet — %d bars fetched, days seen=%s",
+            symbol, today, len(bars15), sorted(by_day.keys()),
+        )
         return None
 
     today_vol  = by_day[today]
     prior_vols = [v for d, v in by_day.items() if d < today]
     if not prior_vols:
+        logger.debug(
+            "RVOL %s: no prior-day 15-min bars in 3-day lookback — days seen=%s",
+            symbol, sorted(by_day.keys()),
+        )
         return None
 
     avg_prior = sum(prior_vols) / len(prior_vols)
     if avg_prior == 0:
+        logger.debug("RVOL %s: prior-day volume summed to 0 across %d day(s)", symbol, len(prior_vols))
         return None
 
     return round(today_vol / avg_prior, 2)

@@ -1,18 +1,137 @@
 # TODO
 
+## From 2026-08-17 daily review (no trades today)
+
+- [x] **RVOL bug — fully root-caused and fixed 2026-08-17 (not a feed-lag
+      issue after all).** `bars15` was fetched with
+      `start = now - timedelta(days=3)`, pinned to *today's exact clock
+      time*, not midnight. That has enough slack on a normal weekday, but
+      **2026-08-17 is a Monday**: `now - 3 days` lands on Friday at the
+      identical clock time, so Friday's early-session bars (market open
+      through that time) are structurally never inside the fetch window.
+      `avg_prior` comes back `0` → `_rvol_time_adjusted` returns `None` →
+      logged as a fake `0.0x`, all day, every cycle. **Recurs every Monday
+      and after any holiday**, not just 08-17 — this wasn't a one-off.
+        - **Confirmed with live replay, not just theory:** re-ran the exact
+          calc for real 08-17 skip events with the fixed window. NBIZ went
+          from `None` to real values (1.76x at 10:07 ET, 1.24x at 15:43
+          ET); KEEL similarly (1.06x, 1.17x).
+        - **NBIZ genuinely would have been bought around 10:07 ET today.**
+          All 28 of its SML skips were RVOL-only — it had already cleared
+          every other filter (exclude list, cooldown, daily-gain cap, ATR,
+          VWAP, change%, MACD-freshness) each time, with RVOL=1.76x > the
+          1.5x min as the very last gate, falsely rejected. KEEL's real
+          RVOL was genuinely under 1.5x both times checked — that one
+          wasn't a false rejection.
+        - **Fix applied** in both `run_sml_screener.py` and
+          `run_sml2_screener.py`: lookback now anchors to midnight 7
+          calendar days back instead of "now minus 3 days," which survives
+          any single weekend or one-day holiday. `python -m py_compile`
+          clean on both.
+        - Kept the DEBUG branch-reason logging and `None`-vs-`0.0x` log-line
+          fix from the first pass — still useful as a tripwire if this class
+          of bug resurfaces (e.g. around a multi-day holiday the 7-day
+          window doesn't cover).
+
+- [x] **Manually reconcile the stuck EOSE position (#120) in `stockbot.db`.**
+      Fixed local `pi_data/stockbot.db` copy directly (2026-08-17): marked
+      closed, sell_price=4.347692, sell_time=2026-08-12T13:32:43Z,
+      pnl=+$6.84 (matches the values already present in the stale root
+      `stockbot.db` dev copy, position id 447, which had this closed
+      correctly). **Still needs to be run on the live Pi's `stockbot.db`
+      to actually stop the retry loop** — no SSH/network access to the Pi
+      from this machine, so couldn't apply it there directly:
+      `sqlite3 stockbot.db "UPDATE positions SET status='closed', sell_price=4.347692, sell_time='2026-08-12T13:32:43.066339+00:00', pnl=6.839976 WHERE id=120 AND symbol='EOSE' AND status='open';"`
+      Bigger fix (retry-without-dedup + no reconciliation pass against
+      Alpaca, see [[project_eose_stuck_position_bug]]) still open, can wait.
+
+- [ ] **Watch CONL tomorrow.** Rejected 5x in SML2 on MACD-crossover
+      freshness (`1-2 bars < 3 min`) early in the 08-17 session — a real
+      setup building, just hadn't matured past the freshness gate yet. Also
+      hit by the RVOL 0.0x bug above later in the day, so its true RVOL is
+      unknown. If it shows up again, worth a manual look once the RVOL fix
+      lands.
+
+## From 2026-08-14 daily review
+
+- [x] **Extend SML2's trading day past 11:45 ET — engineering done, exact
+      cutoff value is a decision for you, not picked automatically.**
+      Added `SML2_STOP_BUY_TIME_ET` override in `run_sml2_screener.py`
+      (2026-08-17), mirroring SML's existing `SML_STOP_BUY_TIME_ET` pattern
+      exactly (`"off"` disables it, shared `STOP_BUY_TIME_ET` untouched so
+      MID/SUPER aren't affected). Not yet set in `.env` — no cutoff change
+      has gone live.
+        - **Evidence pulled (full history, not just a sample):** every SML
+          buy after 11:45 ET across the whole DB — only 7 trades total
+          since tracking began: OPEN (7/30, $0), BBAI (8/4, -$1.04), CONL
+          (8/7, -$1.52), DXF (8/11, -$3.04), EOSE (8/11, +$6.84), OPEN
+          (8/13, $0), HUMA (8/14, +$12.52). **Net +$13.76, 2/7 winners.**
+          BBAI and DXF were both near-dump-time entries with no room to
+          develop — exactly the pattern [[project_hard_stop_bug_fix]]'s
+          sibling fix (`SML_MIN_MINUTES_TO_DUMP`, commit `746a756`) already
+          guards against, and **SML2 already has the equivalent
+          `SML2_MIN_MINUTES_TO_DUMP` support** (confirmed in code), so that
+          specific failure mode should be covered whenever the cutoff is
+          extended. Net-of-those-two: +$17.84 across the remaining 5.
+        - **Recommendation, not applied:** data leans positive but n=7 is
+          thin. Given SML runs with its cutoff fully off
+          (`SML_STOP_BUY_TIME_ET=off`) and the two bots are meant to be an
+          A/B pair on the same underlying strategy (see
+          [[project_focus_sml]]), the simplest matching move would be
+          `SML2_STOP_BUY_TIME_ET=off` rather than picking a specific
+          halfway time like 13:00 — but that's your call on how much
+          you're comfortable extending, and DUMP_TIME_ET should stay in
+          place either way as the real backstop. Let me know the value and
+          I'll set it.
+
+- [x] **ZCMD loss 2026-08-14 — all three questions resolved 2026-08-17.**
+        - **Post-exit price action, checked:** pulled 5-min bars for the
+          rest of 08-14. Price never recovered back toward the $1.11 entry
+          — peaked around $1.08 mid-afternoon (13:00-13:25 ET) and drifted
+          $1.00-1.07 the rest of the day. **VWAP-reclaim earned its keep
+          here** — not a false positive like the OKLL case, no further
+          exit-side edge to find on this trade.
+        - **RVOL=5.6x cross-check, done:** bucketed win-rate/avg-pnl by
+          RVOL across all 117 closed trades with data. The 5-7x bucket
+          (n=8) came back 12.5% win / -$3.49 avg — close to the >10x
+          bucket's 9.1%/-$4.50, notably worse than the 1-3x buckets around
+          it. **Suggestive that the exhaustion pattern extends down to 5x,
+          not just >10x** — but n=8 is too thin to act on alone. Flagging,
+          not changing `MAX_RVOL` yet; worth re-checking once more 5-7x
+          trades accumulate.
+        - **ZCMD track record, resolved:** 0/4 wins across both 08-07 and
+          08-14, both SML and SML2, total -$18.69. Added to
+          `EXCLUDE_SYMBOLS` in `.env` (2026-08-17) alongside MSTU/TZA/HTZ —
+          same bar, same treatment.
+
 ## From 2026-08-07 SML/SML2 daily review — reviewed 2026-08-09
 
-- [ ] **OKLL-style winners may be getting capped by MAX_HOLD_MINUTES (90m).**
-      Confirmed with Alpaca 5-min bars for 2026-08-07: SML exited OKLL at
-      11:53 ET ($3.67, +11.4%), SML2 at 11:32 ET ($3.64, +10.1%), both on the
-      90m cap. Price kept climbing after both exits, peaking ~$3.87 around
-      15:20 ET (+5.5% past SML's exit) before giving most of it back into the
-      close (~$3.66-3.75). So the cutoff did cost real upside on this
-      instance, though a chunk of the extra move round-tripped by end of day.
-      Still open: design a trailing-stop-tightening mechanism for positions
-      past their gain checkpoints instead of (or alongside) the flat 90m
-      cutoff. Worth checking a few more big-mover instances before building,
-      since this one sample alone isn't a slam dunk.
+- [x] **OKLL-style winners capped by MAX_HOLD_MINUTES (90m) — checked 4 more
+      instances (2026-08-17), confirms the pattern but also the risk of
+      just raising the cap.** Full history has only 5 trades ever
+      time-exited near 90min with >5% gain: OKLL x2 (already documented),
+      BATL (07-23, +6.5%), SPHL (07-07, +5.3%), INMB (06-25, +5.1%). Pulled
+      15-min bars for all three new ones past their exit:
+        - **BATL**: ran to +12% intraday (vs +6.5% exit) by ~14:00 ET, gave
+          most back to ~+8% by close.
+        - **SPHL**: kept climbing for *hours* — still up ~+15% by 15:00 ET
+          (vs +5.3% exit) — then **violently round-tripped in the final
+          15-min bar**, closing near session lows. Would've turned a good
+          hold into a much worse exit if held to the literal close.
+        - **INMB**: chopped flat/down for ~2.5hrs, then a genuine second
+          leg to +13% around 14:15-14:30 ET, faded back to ~+7% by close.
+        - **Conclusion: real upside is being left on the table (4/5
+          instances kept running well past the 90m cap), but "just raise
+          MAX_HOLD_MINUTES" is not a safe fix on its own** — SPHL shows
+          exactly the failure mode a flat longer cap would walk into
+          (holding into a violent close-time reversal). This supports the
+          original idea better than a flat extension: a
+          trailing-stop-tightening / partial-profit-lock mechanism for
+          positions still green well past 90min, so extra upside gets
+          captured incrementally instead of all-or-nothing. **Still not
+          built — this is a new exit-strategy feature (design + backtest
+          against these 5 + future instances), sizable enough to warrant
+          its own planning session rather than bolting on quickly.**
 
 - [x] **SML "insufficient deployable cash" on 2026-08-07** (need
       $408.52/have $326.81, need $163.36/have $151.56, 19+ skip events).
@@ -162,38 +281,27 @@
 
 ## Code review of the VWAP-reclaim live wire-in (`cb24063`) — 2026-08-12
 
-- [ ] **`vwap_reclaim_exit_price()` can complete its dwell=9 streak on the
-      current, still-forming 1-min bar, not a settled close.**
-      `bot/market_data.py:216` — `bars1` is fetched with `end=now`
-      (`run_sml_screener.py:307-312`, `run_sml2_screener.py:606-611`), so the
-      last bar in the series covers the in-progress minute; its close is
-      just the latest trade tick. If a position already has 8 consecutive
-      *closed* bars below VWAP+entry, that noisy partial bar can complete
-      the streak and fire the exit a bar early on a sub-minute wiggle —
-      `tools/vwap_reclaim_shadow.py` only ever evaluated fully-closed
-      historical bars, so this live edge case wasn't part of what dwell=9
-      was tuned/validated against. Fix: drop the final bar from `bars1`
-      when its timestamp falls in the current, not-yet-elapsed minute.
+- [x] **`vwap_reclaim_exit_price()` can complete its dwell=9 streak on the
+      current, still-forming 1-min bar, not a settled close.** Fixed
+      2026-08-17: added an optional `now` param — when passed, drops the
+      trailing bar if its minute hasn't fully elapsed yet
+      (`bars1[-1].timestamp + timedelta(minutes=1) > now`), before building
+      the VWAP series. Both call sites (`run_sml_screener.py`,
+      `run_sml2_screener.py`) now pass `now=now` (already in scope in
+      `monitor_positions()`). Left the param optional/defaulted to `None`
+      so `tools/vwap_reclaim_shadow.py`'s historical-bar shadow-testing
+      stays unaffected. Verified with synthetic bars: settled streak still
+      fires, in-progress last bar gets dropped (streak short by one, no
+      fire), no-`now` call still fires (back-compat) — see conversation for
+      the ad-hoc script. `python -m py_compile` clean on all three files.
 
-- [ ] **Unguarded naive-vs-aware datetime comparison could abort a whole
-      monitor cycle.** `run_sml_screener.py:389` / `run_sml2_screener.py:723`
-      — `buy_dt = datetime.fromisoformat(pos["buy_time"])` is compared
-      against tz-aware Alpaca bar timestamps in `bot/market_data.py:217`
-      with no tzinfo normalization. `tools/backfill_entry_stats.py:206-208`
-      defensively normalizes naive `buy_time` rows with `pytz.UTC`, which
-      proves such rows have existed in this DB before. If
-      `monitor_positions()` ever hits one, the comparison raises
-      `TypeError` and — since the position loop has no try/except — every
-      position after the bad one goes unchecked that cycle (hard stop, time
-      exit, RSI, all skipped). Pre-existing risk (the older
-      `held_min = (now - buy_dt)` subtraction has the same exposure), not
-      introduced by this commit, but this commit is the first place in the
-      checkpoint chain to hit it and it's still unguarded. Low likelihood
-      today since every current write path
-      (`run_sml_screener.py:712`, `run_sml2_screener.py:1032`, `trade.py:73`,
-      `run_live_screener.py:503`) uses `datetime.now(timezone.utc)` or
-      Alpaca's `filled_at`, both tz-aware. Cheap fix: normalize `buy_dt`
-      tzinfo right after parsing, same as `backfill_entry_stats.py` does.
+- [x] **Unguarded naive-vs-aware datetime comparison could abort a whole
+      monitor cycle.** Fixed 2026-08-17: both screeners now normalize
+      `buy_dt` right after `datetime.fromisoformat(pos["buy_time"])` —
+      `if buy_dt.tzinfo is None: buy_dt = buy_dt.replace(tzinfo=timezone.utc)`
+      — same pattern `tools/backfill_entry_stats.py` already used. Confirmed
+      the later `held_min = (now - buy_dt)` subtraction reuses this same
+      normalized variable in both files, so one fix covers both exposures.
 
 - [ ] (minor, efficiency) **VWAP-reclaim doubles uncached REST bar-fetches
       per monitor cycle.** `run_sml_screener.py:301-315` /
