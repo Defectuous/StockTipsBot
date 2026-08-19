@@ -16,7 +16,7 @@ before hitting overbought territory.
 """
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 from typing import List, Optional
 
 import pytz
@@ -117,6 +117,83 @@ def _analyze(
         above_vwap          = (price > vwap_val) if vwap_val is not None else False,
         vwap_stdev          = vwap_stdev_val,
         vwap_z              = vwap_z_val,
+    )
+
+
+@dataclass
+class HodBreakoutSignal:
+    symbol:            str
+    price:             float
+    change_pct:        float
+    hod:               float
+    trigger:           float
+    stop:              float
+    consol_range_pct:  float
+    volume_ratio:      float
+    atr:               Optional[float]
+
+
+def _detect_hod_breakout(
+    symbol:      str,
+    bars_1m:     list,
+    price:       float,
+    change_pct:  float,
+    bars_5m:     Optional[list] = None,
+    consol_bars: int = 5,
+    consol_range_pct_max: float = 2.0,
+) -> Optional[HodBreakoutSignal]:
+    """
+    HOD (high-of-day) breakout: stock pauses just below its running high of
+    day in a tight range, then breaks out above it on above-average volume.
+    See strategy.md section 1 and tools/backtest_strategies.py's
+    try_hod_breakout() — backtested as the strongest of the four momentum
+    setups documented there (47 trades, 51% win rate, +0.36% avg P&L, vs.
+    -1.23% avg for vwap_bounce, the next best).
+
+    bars_1m must be ascending 1-min bars anchored to market open (09:30 ET);
+    bars_1m[-1] is treated as the still-forming current bar (HOD and the
+    consolidation window are measured over the bars strictly before it, so
+    the breakout bar itself never inflates its own reference level). The
+    live `price` snapshot (not bars_1m[-1].high) is used for the trigger
+    comparison so a fresh tick doesn't have to wait for its bar to close.
+
+    Kill switch: no breakout considered past 11:30 ET, matching strategy.md's
+    "kills the setup: past 11:30 AM".
+    """
+    if len(bars_1m) < consol_bars + 1:
+        return None
+    now_et = bars_1m[-1].timestamp.astimezone(pytz.timezone("America/New_York"))
+    if now_et.time() > dt_time(11, 30):
+        return None
+
+    running_hod = max(b.high for b in bars_1m[:-1])
+    consol = bars_1m[-1 - consol_bars: -1]
+    consol_hi = max(b.high for b in consol)
+    consol_lo = min(b.low for b in consol)
+    if consol_hi <= 0:
+        return None
+    actual_range_pct = (consol_hi - consol_lo) / consol_hi * 100
+    if actual_range_pct > consol_range_pct_max or consol_hi < running_hod * 0.98:
+        return None
+
+    avg_consol_vol = sum(b.volume for b in consol) / len(consol)
+    last = bars_1m[-1]
+    trigger = running_hod * 1.0015
+    if avg_consol_vol <= 0 or price < trigger or last.volume < 2 * avg_consol_vol:
+        return None
+
+    stop = min(consol_lo, running_hod * 0.98)
+    atr_val = _atr(bars_5m) if bars_5m else None
+    return HodBreakoutSignal(
+        symbol            = symbol,
+        price             = price,
+        change_pct        = change_pct,
+        hod               = round(running_hod, 4),
+        trigger           = round(trigger, 4),
+        stop              = round(stop, 4),
+        consol_range_pct  = round(actual_range_pct, 2),
+        volume_ratio      = round(last.volume / avg_consol_vol, 2),
+        atr               = atr_val,
     )
 
 

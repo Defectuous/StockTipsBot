@@ -1,9 +1,12 @@
 """
-Small-cap most-active + MACD/RSI screener loop ($0.50–$5.00).
+Small-cap most-active + HOD-breakout screener loop ($0.50–$5.00).
 
 Every SCAN_INTERVAL_SECONDS the script:
   1. Fetches the top 100 most active penny stocks ($0.50–$5.00)
-  2. Screens each for a bullish MACD + RSI bounce setup
+  2. Screens each for a HOD (high-of-day) breakout setup — see
+     bot/screener.py:_detect_hod_breakout and strategy.md section 1.
+     Backtested (tools/backtest_strategies.py) as the strongest of the
+     four strategy.md setups: 47 trades, 51% win rate, +0.36% avg P&L.
   3. Buys any that pass, subject to per-stock cooldown and MAX_POSITIONS limit
 
 Wallet:
@@ -49,21 +52,14 @@ Config (env vars or .env):
                           minutes post-entry
   MAX_ENTRY_MOVE_PCT      skip buys already up > this %            default: 0 (off)
   MAX_ATR                 skip buys with ATR above this            default: 0 (off)
-  MAX_VWAP_Z              skip buys this many stdevs above VWAP    default: 0 (off)
-                          or more — a high z-score means price has
-                          run up far from its volume-weighted mean
-                          for the session, which historically raises
-                          the odds of a pullback/reversal rather than
-                          continuation
   MAX_RVOL                skip buys with RVOL above this           default: 0 (off)
   MIN_RVOL                skip buys with RVOL below this           default: 2.0
   MIN_CHANGE_PCT          skip buys flat/red on the day below this default: 2.0
-  MACD_MIN_BARS_ABOVE_SIGNAL  skip buys where MACD crossed above    default: 0 (off)
-                          signal fewer than this many 15-min bars
-                          ago — filters out the freshest crossovers,
-                          which backtested worse than more-established
-                          ones (avg PnL -$1.62 fresh vs +$1.32 with
-                          some confirmation, in the 2026-06 to 07 data)
+  HOD_CONSOL_BARS         # of 1-min bars checked for a tight       default: 5
+                          consolidation just below HOD before a
+                          breakout counts
+  HOD_CONSOL_RANGE_PCT    max high-low range (% of consol high)     default: 2.0
+                          allowed in that consolidation window
 """
 import logging
 import os
@@ -98,7 +94,7 @@ from bot.discord_notify import send_alert, send_close, send_error
 from bot.logging_utils import configure_logging
 from bot.market_data import _rsi_series, _rvol_time_adjusted, vwap_reclaim_exit_price
 from bot.most_active import get_most_active_penny_stocks
-from bot.screener import _analyze
+from bot.screener import _detect_hod_breakout
 from bot.trader import Trader
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
@@ -138,11 +134,11 @@ ATR_MIN_STOP_PCT   = float(os.getenv("ATR_MIN_STOP_PCT",     "2.0"))   # floor �
 ATR_MAX_STOP_PCT   = float(os.getenv("ATR_MAX_STOP_PCT",     "10.0"))  # ceiling — never let a high-ATR read blow the stop out past this
 MAX_ENTRY_MOVE_PCT = float(os.getenv("SML_MAX_ENTRY_MOVE_PCT") or os.getenv("MAX_ENTRY_MOVE_PCT", "0"))
 MAX_ATR            = float(os.getenv("MAX_ATR",              "0"))
-MAX_VWAP_Z         = float(os.getenv("MAX_VWAP_Z",           "0"))
 MAX_RVOL           = float(os.getenv("MAX_RVOL",             "0"))
 MIN_RVOL           = float(os.getenv("MIN_RVOL",             "2.0"))
 MIN_CHANGE_PCT     = float(os.getenv("MIN_CHANGE_PCT",        "2.0"))
-MACD_MIN_BARS_ABOVE_SIGNAL = int(os.getenv("MACD_MIN_BARS_ABOVE_SIGNAL", "0"))
+HOD_CONSOL_BARS       = int(os.getenv("HOD_CONSOL_BARS",       "5"))
+HOD_CONSOL_RANGE_PCT  = float(os.getenv("HOD_CONSOL_RANGE_PCT", "2.0"))
 MIN_GAIN_AT_30M    = float(os.getenv("MIN_GAIN_AT_30M",       "-2.0"))
 MIN_GAIN_AT_60M    = float(os.getenv("MIN_GAIN_AT_60M",       "0.0"))
 VWAP_RECLAIM_DWELL_MIN  = int(os.getenv("VWAP_RECLAIM_DWELL_MIN",  "9"))  # 0 = off
@@ -302,7 +298,7 @@ def monitor_positions(
         bars5 = {}
 
     # Market-open-anchored 1-min bars for the VWAP-reclaim exit — needs the
-    # full-session running VWAP, not a rolling lookback (see bars5_vwap in
+    # full-session running VWAP, not a rolling lookback (see bars1_open in
     # scan_and_trade for the same pattern on the entry side).
     bars1 = {}
     if VWAP_RECLAIM_DWELL_MIN > 0:
@@ -393,11 +389,13 @@ def monitor_positions(
         #      VWAP; see bot/market_data.py:vwap_reclaim_exit_price for the
         #      tuned dwell/warmup rationale. ────────────────────────────────
         buy_dt = datetime.fromisoformat(pos["buy_time"])
+        if buy_dt.tzinfo is None:
+            buy_dt = buy_dt.replace(tzinfo=timezone.utc)
         if VWAP_RECLAIM_DWELL_MIN > 0:
             sym_bars1 = list(bars1.get(sym, []))
             break_price = vwap_reclaim_exit_price(
                 sym_bars1, buy_dt, buy_price,
-                VWAP_RECLAIM_DWELL_MIN, VWAP_RECLAIM_WARMUP_MIN,
+                VWAP_RECLAIM_DWELL_MIN, VWAP_RECLAIM_WARMUP_MIN, now=now,
             )
             if break_price is not None:
                 logger.info(
@@ -573,24 +571,38 @@ def scan_and_trade(
         logger.warning("5-min bar fetch failed: %s", e)
         bars5 = {}
 
-    # Market-open-anchored window used only for VWAP, so VWAP reflects the
-    # full session rather than a short rolling lookback.
+    # Market-open-anchored 1-min bars — HOD and the pre-breakout consolidation
+    # window are measured off these (see bot/screener.py:_detect_hod_breakout).
     try:
-        bars5_vwap = data_client.get_stock_bars(StockBarsRequest(
+        bars1_open = data_client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=symbols,
-            timeframe=_5MIN,
+            timeframe=_1MIN,
             start=market_open.astimezone(pytz.UTC),
             end=now,
         )).data
     except Exception as e:
-        logger.warning("VWAP bar fetch failed: %s", e)
-        bars5_vwap = {}
+        logger.warning("1-min bar fetch failed: %s", e)
+        bars1_open = {}
 
+    # Midnight-anchored, not "now minus 3 days" — _rvol_time_adjusted needs each
+    # prior trading day's bars from ITS OWN market open, but a fetch pinned to
+    # now's exact wall-clock time only ever captures bars from that same
+    # clock-time onward on the earliest day in the window. On a normal weekday
+    # that's masked by slack from an extra prior trading day inside 3 days, but
+    # Monday (or the day after any holiday) has only ONE prior trading day
+    # (Friday) inside a naive 3-day window, pinned to today's clock time —
+    # so Friday's early-session bars (market open through that time) are
+    # never fetched, avg_prior comes back 0, and RVOL silently returns None
+    # all day. 7 calendar days back at midnight guarantees at least 2 full
+    # prior trading days survive any single weekend or one-day holiday.
+    rvol_lookback_start = (now_et - timedelta(days=7)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).astimezone(pytz.UTC)
     try:
         bars15 = data_client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=symbols,
             timeframe=_15MIN,
-            start=now - timedelta(days=3),
+            start=rvol_lookback_start,
             end=now,
         )).data
     except Exception as e:
@@ -603,19 +615,20 @@ def scan_and_trade(
         price, chg = price_map[sym]
         if chg is None:
             chg = 0.0
-        result = _analyze(
+        result = _detect_hod_breakout(
             sym,
-            list(bars5.get(sym,  [])),
-            list(bars15.get(sym, [])),
+            list(bars1_open.get(sym, [])),
             price,
             chg,
-            vwap_bars=list(bars5_vwap.get(sym, [])),
+            bars_5m=list(bars5.get(sym, [])),
+            consol_bars=HOD_CONSOL_BARS,
+            consol_range_pct_max=HOD_CONSOL_RANGE_PCT,
         )
-        if result and result.passes:
+        if result:
             passing.append(result)
 
     logger.info(
-        "[%s] Scanned %d stocks -> %d passing MACD+RSI  positions=%d/%d  buy=$%.2f",
+        "[%s] Scanned %d stocks -> %d passing HOD breakout  positions=%d/%d  buy=$%.2f",
         ts, len(symbols), len(passing), open_count, MAX_POSITIONS, buy_amount,
     )
 
@@ -648,23 +661,16 @@ def scan_and_trade(
                         sym, stock.atr, MAX_ATR)
             continue
 
-        if MAX_VWAP_Z > 0 and stock.vwap_z is not None and stock.vwap_z > MAX_VWAP_Z:
-            logger.info("  SKIP %s — %.2f stdevs above VWAP (limit %.1f) — overextended, elevated reversal risk",
-                        sym, stock.vwap_z, MAX_VWAP_Z)
-            continue
-
         if MIN_CHANGE_PCT > 0 and (stock.change_pct is None or stock.change_pct < MIN_CHANGE_PCT):
             logger.info("  SKIP %s — change %.2f%% < %.1f%% min", sym, stock.change_pct or 0.0, MIN_CHANGE_PCT)
             continue
 
-        if MACD_MIN_BARS_ABOVE_SIGNAL > 0 and stock.macd_bars_above_signal < MACD_MIN_BARS_ABOVE_SIGNAL:
-            logger.info("  SKIP %s — MACD crossover too fresh (%d bars < %d min)",
-                        sym, stock.macd_bars_above_signal, MACD_MIN_BARS_ABOVE_SIGNAL)
-            continue
-
-        rvol_ta = _rvol_time_adjusted(list(bars15.get(sym, [])), now_et)
+        rvol_ta = _rvol_time_adjusted(list(bars15.get(sym, [])), now_et, symbol=sym)
         if MIN_RVOL > 0 and (rvol_ta is None or rvol_ta < MIN_RVOL):
-            logger.info("  SKIP %s — RVOL %.1fx < %.1fx min", sym, rvol_ta or 0.0, MIN_RVOL)
+            if rvol_ta is None:
+                logger.info("  SKIP %s — RVOL unavailable (no bar data) < %.1fx min", sym, MIN_RVOL)
+            else:
+                logger.info("  SKIP %s — RVOL %.1fx < %.1fx min", sym, rvol_ta, MIN_RVOL)
             continue
         if MAX_RVOL > 0 and rvol_ta and rvol_ta > MAX_RVOL:
             logger.info("  SKIP %s — RVOL %.1fx > %.0fx max", sym, rvol_ta, MAX_RVOL)
@@ -688,11 +694,11 @@ def scan_and_trade(
             continue
 
         logger.info(
-            "  BUY  %s  $%.4f  RSI=%.1f  chg=%+.2f%% (min %.1f%%)  RVOL=%.1fx (min %.1fx)  "
-            "VWAP=%s (z=%s)  budget=$%.2f  stop=-%.1f%% (ATR-sized)",
-            sym, stock.price, stock.rsi, stock.change_pct, MIN_CHANGE_PCT, rvol_ta or 0.0,
-            MIN_RVOL, "ok" if stock.above_vwap else "fail",
-            f"{stock.vwap_z:+.2f}" if stock.vwap_z is not None else "n/a",
+            "  BUY  %s  $%.4f  HOD=$%.4f (broke +%.2f%%)  consol_range=%.1f%%  vol=%.1fx avg  "
+            "chg=%+.2f%% (min %.1f%%)  RVOL=%.1fx (min %.1fx)  budget=$%.2f  stop=-%.1f%% (ATR-sized)",
+            sym, stock.price, stock.hod, (stock.price / stock.hod - 1) * 100,
+            stock.consol_range_pct, stock.volume_ratio,
+            stock.change_pct, MIN_CHANGE_PCT, rvol_ta or 0.0, MIN_RVOL,
             sized_amount, stop_pct,
         )
 
@@ -726,12 +732,9 @@ def scan_and_trade(
             buy_price            = fill_price,
             buy_time             = datetime.now(timezone.utc),
             buy_order_id         = str(filled.id),
-            rsi_at_entry         = stock.rsi,
             atr_at_entry         = stock.atr,
             change_pct_at_entry  = stock.change_pct,
-            macd_crossover_fresh = stock.macd_crossover,
             rvol_at_entry        = round(rvol_ta, 3) if rvol_ta else None,
-            vwap_z_at_entry      = stock.vwap_z,
             stop_pct_at_entry    = stop_pct,
         )
 
@@ -782,7 +785,7 @@ def scan_and_trade(
                 symbol         = sym,
                 provider       = provider,
                 price          = fill_price,
-                rsi            = stock.rsi,
+                rsi            = None,
                 volume         = int(volume_map.get(sym, 0)),
                 momentum       = stock.change_pct,
                 shares_bought  = fill_qty,
@@ -796,7 +799,7 @@ def scan_and_trade(
 def main():
     mode = "PAPER" if ALPACA_PAPER else "LIVE"
     logger.info("=" * 60)
-    logger.info("SML screener starting  [%s]", SCREENER_ID)
+    logger.info("SML screener starting  [%s]  strategy=hod_breakout", SCREENER_ID)
     logger.info("Mode: %s | MaxPos: %d | Reserve: %.0f%% | Stop: %.0f%% | Lock: +%.0f%%->%.0f%% | RSI exit: %.0f",
                 mode, MAX_POSITIONS, RESERVE_PCT, TRAIL_PCT, PROFIT_LOCK_PCT, TIGHT_STOP_PCT, RSI_EXIT_LEVEL)
     logger.info("Cooldown: %ds | Interval: %ds", COOLDOWN_SECS, SCAN_INTERVAL)
@@ -805,13 +808,12 @@ def main():
                     START_TIME_ET or "off", STOP_BUY_TIME_ET or "off", DUMP_TIME_ET or "off",
                     MIN_MINUTES_TO_DUMP or "off")
     logger.info(
-        "Entry filters: MIN_RVOL=%.1fx  MAX_RVOL=%s  MIN_CHANGE_PCT=%.1f%%  "
-        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  MAX_VWAP_Z=%s  MACD_MIN_BARS_ABOVE_SIGNAL=%s  EXCLUDE_SYMBOLS=%s",
+        "Entry filters: HOD_CONSOL_BARS=%d  HOD_CONSOL_RANGE_PCT=%.1f%%  MIN_RVOL=%.1fx  MAX_RVOL=%s  "
+        "MIN_CHANGE_PCT=%.1f%%  MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  EXCLUDE_SYMBOLS=%s",
+        HOD_CONSOL_BARS, HOD_CONSOL_RANGE_PCT,
         MIN_RVOL, MAX_RVOL if MAX_RVOL > 0 else "off", MIN_CHANGE_PCT,
         MAX_ENTRY_MOVE_PCT if MAX_ENTRY_MOVE_PCT > 0 else "off",
         MAX_ATR if MAX_ATR > 0 else "off",
-        MAX_VWAP_Z if MAX_VWAP_Z > 0 else "off",
-        MACD_MIN_BARS_ABOVE_SIGNAL if MACD_MIN_BARS_ABOVE_SIGNAL > 0 else "off",
         ",".join(sorted(EXCLUDE_SYMBOLS)) if EXCLUDE_SYMBOLS else "off",
     )
     logger.info(
