@@ -1,12 +1,11 @@
 """
 SML2 screener — real-time WebSocket position monitoring with REST scan loop.
 
-Small-cap most-active + HOD-breakout screener ($0.50–$5.00 default range).
-WebSocket upgrade of run_sml_screener.py, and as of 2026-08-20 back to running
-the same entry strategy as SML — HOD (high-of-day) breakout, see
-bot/screener.py:_detect_hod_breakout and strategy.md section 1. (SML switched
-2026-08-18; SML2 ran the old RSI/MACD/VWAP screen in the interim — see
-strategy.md history / todo.md for that gap.)
+Small-cap most-active + MACD/RSI screener ($0.50–$5.00 default range).
+WebSocket upgrade of run_sml_screener.py — same backend/gates, async fill
+detection, but a different entry strategy on purpose: SML runs HOD-breakout,
+SML2 runs RSI/MACD/VWAP, so the two remain an A/B test of strategies (not
+just tuning knobs on one shared signal) as of 2026-08-20.
 
 WebSocket improvements over run_sml_screener.py:
 
@@ -61,11 +60,18 @@ Config (env vars or .env):
   MAX_RVOL                skip buys with RVOL above this           default: 0 (off)
   MIN_RVOL                skip buys with RVOL below this           default: 2.0
   MIN_CHANGE_PCT          skip buys flat/red on the day below this default: 2.0
-  HOD_CONSOL_BARS         # of 1-min bars checked for a tight       default: 5
-                          consolidation just below HOD before a
-                          breakout counts
-  HOD_CONSOL_RANGE_PCT    max high-low range (% of consol high)     default: 2.0
-                          allowed in that consolidation window
+  RSI_ENTRY_MIN           skip buys with RSI below this            default: 60
+  RSI_ENTRY_MAX           skip buys with RSI above this            default: 70
+  MACD_MIN_BARS_ABOVE_SIGNAL  skip buys where MACD crossed above    default: 3
+                          signal fewer than this many 15-min bars
+                          ago — filters out the freshest crossovers.
+                          Live data through 2026-07-29 backs this:
+                          SML fresh-crossover trades averaged -$1.75
+                          (27% win rate, n=48) vs +$1.32 (46% win
+                          rate, n=13) for confirmed ones, so SML2
+                          now requires confirmation instead of
+                          freshness. Override with
+                          SML2_MACD_MIN_BARS_ABOVE_SIGNAL.
 """
 import asyncio
 import logging
@@ -106,7 +112,7 @@ from bot.discord_notify import send_alert, send_close, send_error
 from bot.logging_utils import configure_logging
 from bot.market_data import _rsi_series, _rvol_time_adjusted, estimate_entry_indicators, vwap_reclaim_exit_price
 from bot.most_active import get_most_active_penny_stocks
-from bot.screener import _detect_hod_breakout
+from bot.screener import _analyze
 from bot.trader import Trader
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
@@ -150,8 +156,12 @@ MAX_ATR          = float(os.getenv("MAX_ATR",                 "0"))
 MAX_RVOL         = float(os.getenv("MAX_RVOL",                "0"))
 MIN_RVOL         = float(os.getenv("MIN_RVOL",                "2.0"))
 MIN_CHANGE_PCT   = float(os.getenv("MIN_CHANGE_PCT",           "2.0"))
-HOD_CONSOL_BARS      = int(os.getenv("HOD_CONSOL_BARS",        "5"))
-HOD_CONSOL_RANGE_PCT = float(os.getenv("HOD_CONSOL_RANGE_PCT", "2.0"))
+RSI_ENTRY_MIN    = float(os.getenv("RSI_ENTRY_MIN",            "60"))
+RSI_ENTRY_MAX    = float(os.getenv("RSI_ENTRY_MAX",            "70"))
+MACD_MIN_BARS_ABOVE_SIGNAL = int(
+    os.getenv("SML2_MACD_MIN_BARS_ABOVE_SIGNAL")
+    or os.getenv("MACD_MIN_BARS_ABOVE_SIGNAL", "3")
+)
 MIN_GAIN_AT_30M  = float(os.getenv("MIN_GAIN_AT_30M",          "-2.0"))
 MIN_GAIN_AT_60M  = float(os.getenv("MIN_GAIN_AT_60M",          "0.0"))
 VWAP_RECLAIM_DWELL_MIN  = int(os.getenv("VWAP_RECLAIM_DWELL_MIN",  "9"))  # 0 = off
@@ -897,18 +907,18 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
         logger.warning("5-min bar fetch failed: %s", e)
         bars5 = {}
 
-    # Market-open-anchored 1-min bars — HOD and the pre-breakout consolidation
-    # window are measured off these (see bot/screener.py:_detect_hod_breakout).
+    # Market-open-anchored window used only for VWAP, so VWAP reflects the
+    # full session rather than a short rolling lookback.
     try:
-        bars1_open = data_client.get_stock_bars(StockBarsRequest(
+        bars5_vwap = data_client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=symbols,
-            timeframe=_1MIN,
+            timeframe=_5MIN,
             start=market_open.astimezone(pytz.UTC),
             end=now,
         )).data
     except Exception as e:
-        logger.warning("1-min bar fetch failed: %s", e)
-        bars1_open = {}
+        logger.warning("VWAP bar fetch failed: %s", e)
+        bars5_vwap = {}
 
     # Midnight-anchored, not "now minus 3 days" — see run_sml_screener.py for
     # the full rationale. A fetch pinned to now's exact wall-clock time only
@@ -934,22 +944,19 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
     passing = []
     for sym in symbols:
         price, chg = price_map[sym]
-        if chg is None:
-            chg = 0.0
-        result = _detect_hod_breakout(
+        result = _analyze(
             sym,
-            list(bars1_open.get(sym, [])),
+            list(bars5.get(sym,  [])),
+            list(bars15.get(sym, [])),
             price,
-            chg,
-            bars_5m=list(bars5.get(sym, [])),
-            consol_bars=HOD_CONSOL_BARS,
-            consol_range_pct_max=HOD_CONSOL_RANGE_PCT,
+            chg or 0.0,
+            vwap_bars=list(bars5_vwap.get(sym, [])),
         )
-        if result:
+        if result and result.passes:
             passing.append(result)
 
     logger.info(
-        "[%s] Scanned %d stocks -> %d passing HOD breakout  pos=%d/%d  buy=$%.2f",
+        "[%s] Scanned %d stocks -> %d passing MACD+RSI  pos=%d/%d  buy=$%.2f",
         ts, len(symbols), len(passing), open_count, MAX_POSITIONS, buy_amount,
     )
 
@@ -984,6 +991,16 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             logger.info("  SKIP  %s — change %.2f%% < %.1f%% min", sym, stock.change_pct or 0.0, MIN_CHANGE_PCT)
             continue
 
+        if not (RSI_ENTRY_MIN <= stock.rsi <= RSI_ENTRY_MAX):
+            logger.info("  SKIP  %s — RSI %.1f outside entry band %.0f-%.0f",
+                        sym, stock.rsi, RSI_ENTRY_MIN, RSI_ENTRY_MAX)
+            continue
+
+        if MACD_MIN_BARS_ABOVE_SIGNAL > 0 and stock.macd_bars_above_signal < MACD_MIN_BARS_ABOVE_SIGNAL:
+            logger.info("  SKIP  %s — MACD crossover too fresh (%d bars < %d min)",
+                        sym, stock.macd_bars_above_signal, MACD_MIN_BARS_ABOVE_SIGNAL)
+            continue
+
         rvol_ta = _rvol_time_adjusted(list(bars15.get(sym, [])), now_et, symbol=sym)
         if MIN_RVOL > 0 and (rvol_ta is None or rvol_ta < MIN_RVOL):
             if rvol_ta is None:
@@ -1013,12 +1030,10 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             continue
 
         logger.info(
-            "  BUY   %s  $%.4f  HOD=$%.4f (broke +%.2f%%)  consol_range=%.1f%%  vol=%.1fx avg  "
-            "chg=%+.2f%% (min %.1f%%)  RVOL=%.1fx (min %.1fx)  budget=$%.2f  stop=-%.1f%% (ATR-sized)",
-            sym, stock.price, stock.hod, (stock.price / stock.hod - 1) * 100,
-            stock.consol_range_pct, stock.volume_ratio,
-            stock.change_pct, MIN_CHANGE_PCT, rvol_ta or 0.0, MIN_RVOL,
-            sized_amount, stop_pct,
+            "  BUY   %s  $%.4f  RSI=%.1f  chg=%+.2f%% (min %.1f%%)  RVOL=%.1fx (min %.1fx)  "
+            "VWAP=%s  budget=$%.2f  stop=-%.1f%% (ATR-sized)",
+            sym, stock.price, stock.rsi, stock.change_pct, MIN_CHANGE_PCT, rvol_ta or 0.0,
+            MIN_RVOL, "ok" if stock.above_vwap else "fail", sized_amount, stop_pct,
         )
 
         order, err = trader.buy_stock(sym, sized_amount, stock.price)
@@ -1053,8 +1068,10 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             buy_price            = fill_price,
             buy_time             = datetime.now(timezone.utc),
             buy_order_id         = str(filled.id),
+            rsi_at_entry         = stock.rsi,
             atr_at_entry         = stock.atr,
             change_pct_at_entry  = stock.change_pct,
+            macd_crossover_fresh = stock.macd_crossover,
             rvol_at_entry        = round(rvol_ta, 3) if rvol_ta else None,
             stop_pct_at_entry    = stop_pct,
         )
@@ -1118,7 +1135,7 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
                 symbol         = sym,
                 provider       = PROVIDER,
                 price          = fill_price,
-                rsi            = None,
+                rsi            = stock.rsi,
                 volume         = int(volume_map.get(sym, 0)),
                 momentum       = stock.change_pct,
                 shares_bought  = fill_qty,
@@ -1135,7 +1152,7 @@ def main():
     global _trader
     mode = "PAPER" if ALPACA_PAPER else "LIVE"
     logger.info("=" * 60)
-    logger.info("SML2 screener starting  [%s]  strategy=hod_breakout", SCREENER_ID)
+    logger.info("SML2 screener starting  [%s]", SCREENER_ID)
     logger.info(
         "Mode: %s | MaxPos: %d | Reserve: %.0f%% | Stop: %.0f%% | "
         "Lock: +%.0f%%->%.0f%% | RSI exit: %.0f",
@@ -1153,12 +1170,13 @@ def main():
             MIN_MINUTES_TO_DUMP or "off",
         )
     logger.info(
-        "Entry filters: HOD_CONSOL_BARS=%d  HOD_CONSOL_RANGE_PCT=%.1f%%  MIN_RVOL=%.1fx  MAX_RVOL=%s  "
-        "MIN_CHANGE_PCT=%.1f%%  MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  EXCLUDE_SYMBOLS=%s",
-        HOD_CONSOL_BARS, HOD_CONSOL_RANGE_PCT,
+        "Entry filters: MIN_RVOL=%.1fx  MAX_RVOL=%s  MIN_CHANGE_PCT=%.1f%%  "
+        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  RSI_ENTRY=%.0f-%.0f  MACD_MIN_BARS_ABOVE_SIGNAL=%s  EXCLUDE_SYMBOLS=%s",
         MIN_RVOL, MAX_RVOL if MAX_RVOL > 0 else "off", MIN_CHANGE_PCT,
         MAX_ENTRY_MOVE_PCT if MAX_ENTRY_MOVE_PCT > 0 else "off",
         MAX_ATR if MAX_ATR > 0 else "off",
+        RSI_ENTRY_MIN, RSI_ENTRY_MAX,
+        MACD_MIN_BARS_ABOVE_SIGNAL if MACD_MIN_BARS_ABOVE_SIGNAL > 0 else "off",
         ",".join(sorted(EXCLUDE_SYMBOLS)) if EXCLUDE_SYMBOLS else "off",
     )
     logger.info(
