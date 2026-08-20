@@ -1,6 +1,10 @@
 """
-backtest_sml2.py — Replay SML2's *current* entry/exit config against the last
-N days of price data for symbols traded in that window, per symbol per day.
+backtest_sml2.py — Replay one of SML2's two historical entry strategies
+against the last N days of price data for symbols traded in that window,
+per symbol per day. Pick which strategy with --strategy before it starts —
+SML2 ran RSI/MACD/VWAP through 2026-08-19 and switched to HOD-breakout on
+2026-08-20 (see run_sml2_screener.py), so this tool no longer assumes one
+or the other.
 
 Scope (see conversation for why): single-symbol standalone backtest — each
 (day, symbol) pair is tested independently, as if it had its own dedicated
@@ -9,24 +13,37 @@ day's whole candidate universe (that universe isn't reconstructable — it's
 a live "most active" snapshot that was never persisted), and it reports %
 returns, not $ PnL (which would need day-by-day account-equity simulation).
 
-Entry logic replicates the two layers scan_and_trade() actually applies:
-  Layer 1 (bot/screener.py _analyze().passes) — RSI 50-65 & rising over the
-    last 2 bars, MACD above signal with expanding histogram, price > VWAP.
-  Layer 2 (SML2's own gates on top) — cooldown (N/A, single symbol/day),
-    change_pct in [MIN_CHANGE_PCT, MAX_ENTRY_MOVE_PCT], RSI in
-    [RSI_ENTRY_MIN, RSI_ENTRY_MAX], fresh MACD crossover, RVOL >= MIN_RVOL.
-  Net effect: layer 1's hard 65-cap means the *effective* RSI band is
-  60-65, not 60-70 — RSI_ENTRY_MAX=70 never actually binds.
+Entry logic replicates the two layers scan_and_trade() actually applies,
+depending on --strategy:
 
-Exit logic replicates monitor_positions(): hard stop / trailing stop treated
-as broker-resting orders (checked against each bar's low, whichever trigger
-price is higher wins), then per-bar checks in priority order — max hold,
-60m/30m checkpoints, dump time 12:00 ET, RSI-75-falling exit, profit-lock
-tightening (10% trail -> 5% trail at +15% gain).
+  --strategy rsi_macd (SML2's entry gate through 2026-08-19):
+    Layer 1 (bot/screener.py _analyze().passes) — RSI 50-65 & rising over
+      the last 2 bars, MACD above signal with expanding histogram, price
+      > VWAP.
+    Layer 2 (SML2's own gates on top) — cooldown (N/A, single symbol/day),
+      change_pct in [MIN_CHANGE_PCT, MAX_ENTRY_MOVE_PCT], RSI in
+      [RSI_ENTRY_MIN, RSI_ENTRY_MAX], fresh MACD crossover, RVOL >= MIN_RVOL.
+    Net effect: layer 1's hard 65-cap means the *effective* RSI band is
+    60-65, not 60-70 — RSI_ENTRY_MAX=70 never actually binds.
+
+  --strategy hod (SML2's entry gate from 2026-08-20, same as SML):
+    Layer 1 (bot/screener.py _detect_hod_breakout()) — price breaks above a
+      tight HOD-anchored consolidation (HOD_CONSOL_BARS/HOD_CONSOL_RANGE_PCT)
+      on above-average volume, before 11:30 ET.
+    Layer 2 (SML2's own gates on top) — change_pct in [MIN_CHANGE_PCT,
+      MAX_ENTRY_MOVE_PCT], ATR <= MAX_ATR, RVOL >= MIN_RVOL.
+
+Exit logic replicates monitor_positions() and is identical for both
+strategies (unchanged by the entry-signal switch): hard stop / trailing
+stop treated as broker-resting orders (checked against each bar's low,
+whichever trigger price is higher wins), then per-bar checks in priority
+order — max hold, 60m/30m checkpoints, dump time 12:00 ET, RSI-75-falling
+exit, profit-lock tightening (10% trail -> 5% trail at +15% gain).
 
 Usage:
-    python tools/backtest_sml2.py --days 30
-    python tools/backtest_sml2.py --days 30 --db stockbot.db
+    python tools/backtest_sml2.py --strategy hod --days 30
+    python tools/backtest_sml2.py --strategy rsi_macd --days 30
+    python tools/backtest_sml2.py --strategy hod --days 30 --db stockbot.db
 """
 import argparse
 import os
@@ -44,7 +61,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from bot.market_data import _rsi_series, _rvol_time_adjusted
-from bot.screener import _analyze
+from bot.screener import _analyze, _detect_hod_breakout
 
 load_dotenv()
 
@@ -64,9 +81,16 @@ MIN_RVOL         = float(os.getenv("MIN_RVOL", "1.5"))
 MAX_RVOL         = float(os.getenv("MAX_RVOL", "0"))
 MIN_CHANGE_PCT   = float(os.getenv("MIN_CHANGE_PCT", "2.0"))
 MAX_ENTRY_MOVE_PCT = float(os.getenv("SML2_MAX_ENTRY_MOVE_PCT") or os.getenv("MAX_ENTRY_MOVE_PCT", "0"))
+MAX_ATR          = float(os.getenv("MAX_ATR", "0"))
+
+# rsi_macd strategy only (SML2's entry gate through 2026-08-19)
 RSI_ENTRY_MIN    = float(os.getenv("RSI_ENTRY_MIN", "60"))
 RSI_ENTRY_MAX    = float(os.getenv("RSI_ENTRY_MAX", "70"))
 REQUIRE_MACD_FRESH_CROSSOVER = os.getenv("REQUIRE_MACD_FRESH_CROSSOVER", "true").lower() == "true"
+
+# hod strategy only (SML2's entry gate from 2026-08-20)
+HOD_CONSOL_BARS      = int(os.getenv("HOD_CONSOL_BARS", "5"))
+HOD_CONSOL_RANGE_PCT = float(os.getenv("HOD_CONSOL_RANGE_PCT", "2.0"))
 
 TRAIL_PCT        = float(os.getenv("TRAILING_STOP_PERCENT", "10"))
 HARD_STOP_PCT    = float(os.getenv("HARD_STOP_PCT", "5"))
@@ -146,7 +170,7 @@ def fetch_symbol_data(client: StockHistoricalDataClient, symbol: str, d: date) -
     return dict(bars1=bars1, bars5=bars5, bars15=bars15, prev_close=prev_close)
 
 
-def simulate_entry(symbol: str, data: dict, d: date) -> dict | None:
+def simulate_entry_rsi_macd(symbol: str, data: dict, d: date) -> dict | None:
     """Walk 1-min bars from 09:30 to STOP_BUY_TIME_ET, re-running the exact
     scan_and_trade() gate sequence at each minute, on close prices. Returns
     the first qualifying entry, or None."""
@@ -193,6 +217,61 @@ def simulate_entry(symbol: str, data: dict, d: date) -> dict | None:
 
         return dict(entry_time=ts_et, entry_price=price, rsi=stock.rsi,
                      change_pct=stock.change_pct, rvol=rvol)
+
+    return None
+
+
+def simulate_entry_hod(symbol: str, data: dict, d: date) -> dict | None:
+    """Same walk-forward shape as simulate_entry_rsi_macd, but re-running
+    _detect_hod_breakout() at each minute instead of _analyze(). bars1 is
+    already market-open-anchored for the whole day, so bars1[:i+1] (this
+    bar as the still-forming last bar) is exactly what the live scan passes
+    as bars_1m — no separate fetch needed."""
+    bars1, bars5, bars15 = data["bars1"], data["bars5"], data["bars15"]
+    prev_close = data["prev_close"]
+    stop_buy = _ET.localize(datetime.combine(d, _parse_hm(STOP_BUY_TIME_ET)))
+
+    for i, bar in enumerate(bars1):
+        ts_et = bar.timestamp.astimezone(_ET)
+        if ts_et >= stop_buy:
+            break
+
+        price = bar.close
+        change_pct = round((price - prev_close) / prev_close * 100, 2) if prev_close else 0.0
+
+        # Rolling 120-min window for ATR (mirrors the live "now-120min" fetch)
+        window_start = ts_et - timedelta(minutes=120)
+        b5_window = [b for b in bars5 if window_start <= b.timestamp.astimezone(_ET) <= ts_et]
+
+        signal = _detect_hod_breakout(
+            symbol, bars1[:i + 1], price, change_pct,
+            bars_5m=b5_window, consol_bars=HOD_CONSOL_BARS,
+            consol_range_pct_max=HOD_CONSOL_RANGE_PCT,
+        )
+        if not signal:
+            continue
+
+        # ── Layer 2: SML2's own gates ──────────────────────────────────────
+        if MAX_ENTRY_MOVE_PCT > 0 and signal.change_pct > MAX_ENTRY_MOVE_PCT:
+            continue
+        if MAX_ATR > 0 and signal.atr and signal.atr > MAX_ATR:
+            continue
+        if MIN_CHANGE_PCT > 0 and (signal.change_pct is None or signal.change_pct < MIN_CHANGE_PCT):
+            continue
+
+        # 3-calendar-day trailing window for RVOL
+        b15_window = [b for b in bars15
+                      if (ts_et - timedelta(days=3)) <= b.timestamp.astimezone(_ET) <= ts_et]
+        rvol = _rvol_time_adjusted(b15_window, ts_et)
+        if MIN_RVOL > 0 and (rvol is None or rvol < MIN_RVOL):
+            continue
+        if MAX_RVOL > 0 and rvol and rvol > MAX_RVOL:
+            continue
+
+        return dict(entry_time=ts_et, entry_price=price, hod=signal.hod,
+                     consol_range_pct=signal.consol_range_pct,
+                     volume_ratio=signal.volume_ratio,
+                     change_pct=signal.change_pct, rvol=rvol)
 
     return None
 
@@ -257,18 +336,34 @@ def simulate_exit(bars1: list, entry_time: datetime, entry_price: float) -> dict
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--strategy", choices=["hod", "rsi_macd"], default="hod",
+                         help="Entry gate to replay — hod (SML2's strategy since 2026-08-20, "
+                              "same as SML) or rsi_macd (SML2's strategy through 2026-08-19). "
+                              "Default: hod, matching what's live now.")
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--providers", nargs="+", default=["sml", "sml2"],
                          help="Which providers' historical trade symbols to source the universe from")
     parser.add_argument("--db", default="stockbot.db")
     args = parser.parse_args()
 
-    print(f"SML2 config: RSI={RSI_ENTRY_MIN}-{RSI_ENTRY_MAX} (effective 60-65, layer-1 caps at 65)  "
-          f"MACD_fresh={REQUIRE_MACD_FRESH_CROSSOVER}  RVOL>={MIN_RVOL}x  "
-          f"move={MIN_CHANGE_PCT}-{MAX_ENTRY_MOVE_PCT}%  |  "
-          f"stops: hard={HARD_STOP_PCT}% trail={TRAIL_PCT}%->({TIGHT_STOP_PCT}% @+{PROFIT_LOCK_PCT}%)  "
-          f"time: 30m>={MIN_GAIN_AT_30M}% 60m>={MIN_GAIN_AT_60M}% max={MAX_HOLD_MINUTES}m  "
-          f"RSI exit={RSI_EXIT_LEVEL} falling  dump={DUMP_TIME_ET} ET\n")
+    if args.strategy == "hod":
+        simulate_entry = simulate_entry_hod
+        print(f"SML2 strategy: hod  "
+              f"HOD_CONSOL_BARS={HOD_CONSOL_BARS}  HOD_CONSOL_RANGE_PCT={HOD_CONSOL_RANGE_PCT}%  "
+              f"RVOL>={MIN_RVOL}x  MAX_ATR={MAX_ATR or 'off'}  "
+              f"move={MIN_CHANGE_PCT}-{MAX_ENTRY_MOVE_PCT or 'off'}%  |  "
+              f"stops: hard={HARD_STOP_PCT}% trail={TRAIL_PCT}%->({TIGHT_STOP_PCT}% @+{PROFIT_LOCK_PCT}%)  "
+              f"time: 30m>={MIN_GAIN_AT_30M}% 60m>={MIN_GAIN_AT_60M}% max={MAX_HOLD_MINUTES}m  "
+              f"dump={DUMP_TIME_ET} ET\n")
+    else:
+        simulate_entry = simulate_entry_rsi_macd
+        print(f"SML2 strategy: rsi_macd  "
+              f"RSI={RSI_ENTRY_MIN}-{RSI_ENTRY_MAX} (effective 60-65, layer-1 caps at 65)  "
+              f"MACD_fresh={REQUIRE_MACD_FRESH_CROSSOVER}  RVOL>={MIN_RVOL}x  "
+              f"move={MIN_CHANGE_PCT}-{MAX_ENTRY_MOVE_PCT}%  |  "
+              f"stops: hard={HARD_STOP_PCT}% trail={TRAIL_PCT}%->({TIGHT_STOP_PCT}% @+{PROFIT_LOCK_PCT}%)  "
+              f"time: 30m>={MIN_GAIN_AT_30M}% 60m>={MIN_GAIN_AT_60M}% max={MAX_HOLD_MINUTES}m  "
+              f"RSI exit={RSI_EXIT_LEVEL} falling  dump={DUMP_TIME_ET} ET\n")
 
     db_path = (_ROOT / args.db) if not Path(args.db).is_absolute() else Path(args.db)
     by_day = find_traded_symbols_by_day(db_path, args.providers, args.days)
@@ -288,19 +383,26 @@ def main():
                 continue
             entry = simulate_entry(sym, data, d)
             if not entry:
-                print(f"  {d} {sym}: no qualifying entry under current SML2 gates")
+                print(f"  {d} {sym}: no qualifying entry under current SML2 ({args.strategy}) gates")
                 results.append(dict(date=d, symbol=sym, entered=False))
                 continue
             exit_ = simulate_exit(data["bars1"], entry["entry_time"], entry["entry_price"])
+            if args.strategy == "hod":
+                signal_desc = (f"HOD={entry['hod']:.4f} consol_range={entry['consol_range_pct']:.1f}% "
+                                f"vol={entry['volume_ratio']:.1f}x chg={entry['change_pct']:.1f}% "
+                                f"rvol={entry['rvol']:.1f}x")
+            else:
+                signal_desc = (f"RSI={entry['rsi']:.1f} chg={entry['change_pct']:.1f}% "
+                                f"rvol={entry['rvol']:.1f}x")
             print(f"  {d} {sym}: ENTER {entry['entry_time'].strftime('%H:%M')} @ ${entry['entry_price']:.4f} "
-                  f"(RSI={entry['rsi']:.1f} chg={entry['change_pct']:.1f}% rvol={entry['rvol']:.1f}x)  "
+                  f"({signal_desc})  "
                   f"-> EXIT {exit_['exit_time'].strftime('%H:%M')} @ ${exit_['exit_price']:.4f}  "
                   f"{exit_['gain_pct']:+.1f}%  held={exit_['held_min']}m  ({exit_['reason']})")
             results.append(dict(date=d, symbol=sym, entered=True, **entry, **exit_))
 
     entered = [r for r in results if r["entered"]]
     print(f"\n{'=' * 70}")
-    print(f"{len(entered)}/{len(results)} pairs would have triggered an SML2 entry under current config")
+    print(f"{len(entered)}/{len(results)} pairs would have triggered an SML2 ({args.strategy}) entry under current config")
     if entered:
         wins = [r for r in entered if r["gain_pct"] >= 0]
         avg = sum(r["gain_pct"] for r in entered) / len(entered)
@@ -311,17 +413,29 @@ def main():
         print(f"Worst: {min(entered, key=lambda r: r['gain_pct'])['symbol']} "
               f"{min(r['gain_pct'] for r in entered):+.1f}%")
 
-    out_path = _ROOT / "reports" / "sml2_backtest.csv"
+    out_path = _ROOT / "reports" / f"sml2_backtest_{args.strategy}.csv"
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("date,symbol,entered,entry_time,entry_price,rsi,change_pct,rvol,"
-                "exit_time,exit_price,gain_pct,held_min,reason\n")
-        for r in results:
-            if r["entered"]:
-                f.write(f"{r['date']},{r['symbol']},1,{r['entry_time']},{r['entry_price']},"
-                        f"{r['rsi']:.2f},{r['change_pct']:.2f},{r['rvol']:.2f},"
-                        f"{r['exit_time']},{r['exit_price']},{r['gain_pct']},{r['held_min']},{r['reason']}\n")
-            else:
-                f.write(f"{r['date']},{r['symbol']},0,,,,,,,,,,\n")
+        if args.strategy == "hod":
+            f.write("date,symbol,entered,entry_time,entry_price,hod,consol_range_pct,volume_ratio,"
+                     "change_pct,rvol,exit_time,exit_price,gain_pct,held_min,reason\n")
+            for r in results:
+                if r["entered"]:
+                    f.write(f"{r['date']},{r['symbol']},1,{r['entry_time']},{r['entry_price']},"
+                            f"{r['hod']:.4f},{r['consol_range_pct']:.2f},{r['volume_ratio']:.2f},"
+                            f"{r['change_pct']:.2f},{r['rvol']:.2f},"
+                            f"{r['exit_time']},{r['exit_price']},{r['gain_pct']},{r['held_min']},{r['reason']}\n")
+                else:
+                    f.write(f"{r['date']},{r['symbol']},0,,,,,,,,,,,,\n")
+        else:
+            f.write("date,symbol,entered,entry_time,entry_price,rsi,change_pct,rvol,"
+                    "exit_time,exit_price,gain_pct,held_min,reason\n")
+            for r in results:
+                if r["entered"]:
+                    f.write(f"{r['date']},{r['symbol']},1,{r['entry_time']},{r['entry_price']},"
+                            f"{r['rsi']:.2f},{r['change_pct']:.2f},{r['rvol']:.2f},"
+                            f"{r['exit_time']},{r['exit_price']},{r['gain_pct']},{r['held_min']},{r['reason']}\n")
+                else:
+                    f.write(f"{r['date']},{r['symbol']},0,,,,,,,,,,\n")
     print(f"\nSaved {out_path}")
 
 
