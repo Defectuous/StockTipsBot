@@ -301,7 +301,7 @@ def _close_position_from_stop(order_id: str, fill_price: float) -> None:
         send_close(
             DISCORD_WEBHOOK, pos["symbol"], pos["buy_price"],
             fill_price, pos["shares"], pnl,
-            paper=ALPACA_PAPER, reason="Trailing stop filled",
+            paper=ALPACA_PAPER, reason=reason,
         )
 
 
@@ -1107,7 +1107,7 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
                     logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
                     if DISCORD_WEBHOOK:
                         send_error(DISCORD_WEBHOOK,
-                                   f"⚠️ **{sym}** ({provider}) bought with NO stop-loss resting — "
+                                   f"⚠️ **{sym}** ({PROVIDER}) bought with NO stop-loss resting — "
                                    f"both hard stop and trailing stop failed. Set one manually on Alpaca now.")
         else:
             ts_order = trader.submit_trailing_stop(sym, fill_qty, TRAIL_PCT)
@@ -1119,7 +1119,7 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
                 logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
                 if DISCORD_WEBHOOK:
                     send_error(DISCORD_WEBHOOK,
-                               f"⚠️ **{sym}** ({provider}) bought with NO stop-loss resting — "
+                               f"⚠️ **{sym}** ({PROVIDER}) bought with NO stop-loss resting — "
                                f"trailing stop failed. Set one manually on Alpaca now.")
 
         # Register in memory so TradingStream callback can close without a DB lookup
