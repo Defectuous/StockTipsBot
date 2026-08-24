@@ -96,7 +96,6 @@ from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus
 from alpaca.trading.requests import GetOrdersRequest
-from alpaca.trading.stream import TradingStream
 
 from bot.database import (
     close_position,
@@ -118,6 +117,7 @@ from bot.discord_notify import send_alert, send_close, send_error
 from bot.logging_utils import configure_logging
 from bot.market_data import _rsi_series, _rvol_time_adjusted, estimate_entry_indicators, vwap_reclaim_exit_price
 from bot.most_active import get_most_active_penny_stocks
+from bot.resilient_stream import ResilientTradingStream as TradingStream
 from bot.screener import _detect_hod_breakout
 from bot.trader import Trader
 
@@ -385,8 +385,16 @@ def _start_streams(api_key: str, api_secret: str, paper: bool) -> None:
     """
     global _data_stream, _trading_stream
 
+    def _on_stream_persistent_failure(message: str) -> None:
+        logger.error("Trading stream persistent failure: %s", message)
+        if DISCORD_WEBHOOK:
+            send_error(DISCORD_WEBHOOK, f"[SML] {message}")
+
     _data_stream    = StockDataStream(api_key, api_secret)
-    _trading_stream = TradingStream(api_key, api_secret, paper=paper)
+    _trading_stream = TradingStream(
+        api_key, api_secret, paper=paper,
+        on_persistent_failure=_on_stream_persistent_failure,
+    )
     _trading_stream.subscribe_trade_updates(_on_trade_update)
 
     def _thread():
