@@ -527,6 +527,10 @@ def summarize(label: str, trades: List[dict]):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", default="pi_data/stockbot.db")
+    parser.add_argument("--cache", default=None,
+                        help="Separate price_bars DB to read/write 1-min bars "
+                             "(default: --db). Point at market_data.db to reuse "
+                             "bars stored by tools/store_daily_bars.py.")
     parser.add_argument("--symbols", nargs="+", default=None)
     parser.add_argument("--start", type=date.fromisoformat, default=None)
     parser.add_argument("--end", type=date.fromisoformat, default=None)
@@ -554,7 +558,17 @@ def main():
     api_secret = os.getenv("SML_ALPACA_API_SECRET")
     client = StockHistoricalDataClient(api_key, api_secret)
 
-    cache_conn = sqlite3.connect(str(db_path))
+    cache_path = db_path
+    if args.cache:
+        cache_path = Path(args.cache) if Path(args.cache).is_absolute() else _ROOT / args.cache
+    cache_conn = sqlite3.connect(str(cache_path))
+    cache_conn.execute(
+        "CREATE TABLE IF NOT EXISTS price_bars ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, "
+        "timestamp TIMESTAMP NOT NULL, open REAL NOT NULL, high REAL NOT NULL, "
+        "low REAL NOT NULL, close REAL NOT NULL, volume INTEGER NOT NULL, "
+        "UNIQUE(symbol, timestamp))"
+    )
     stats = Counter()
 
     print("Fetching / caching 1-min bars ...")

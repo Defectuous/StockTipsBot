@@ -1,0 +1,11 @@
+[Unit]
+Description=Run store-daily-bars after each trading session
+
+[Timer]
+# 20:15 local (ET on the Pi) — just after the 20:00 post-market close.
+OnCalendar=Mon-Fri 20:15
+# If the Pi was off at 20:15, run as soon as it is back.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

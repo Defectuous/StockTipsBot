@@ -145,6 +145,28 @@ sudo systemctl start stockbot
 sudo journalctl -u stockbot -f
 ```
 
+### Daily market-data capture
+
+`store-daily-bars.timer` runs `tools/store_daily_bars.py` at 20:15 ET on
+weekdays, after the post-market close. It stores full-session (04:00–20:00 ET)
+1-minute bars for every symbol the SML/SML2 screeners traded or green-flagged
+that day into a standalone `market_data.db` (kept separate from `stockbot.db`
+so the trading DB stays small). Idempotent — safe to re-run any day.
+
+```bash
+sudo cp store-daily-bars.service store-daily-bars.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now store-daily-bars.timer
+
+# Run once by hand (today, or a past day whose log still exists)
+python tools/store_daily_bars.py
+python tools/store_daily_bars.py --date 2026-08-31
+python tools/store_daily_bars.py --backfill-days 30   # traded symbols only
+```
+
+`tools/backtest_strategies.py --cache market_data.db` reuses these bars instead
+of re-fetching from Alpaca.
+
 ---
 
 ## Project Structure
@@ -176,7 +198,11 @@ SQLite file: `stockbot.db`
 |---|---|
 | `processed_emails` | Gmail message IDs already acted on (dedup) |
 | `positions` | Every trade — entry, exit, P&L |
-| `price_bars` | Minute-by-minute OHLC for each tracked symbol |
+| `price_bars` | Minute-by-minute OHLC (backtest cache) |
+
+Full-day 1-minute history for every traded/green-flagged symbol lives in a
+separate `market_data.db` (`price_bars` + `daily_capture`), populated by
+`store-daily-bars.timer` — see [Daily market-data capture](#daily-market-data-capture).
 
 ---
 

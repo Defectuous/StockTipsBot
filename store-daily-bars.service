@@ -1,0 +1,17 @@
+[Unit]
+Description=StockTipsBot — persist full-day 1-min bars for the day's tracked symbols
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=defectuous
+WorkingDirectory=/home/defectuous/StockTipsBot
+# market_data.db is kept beside the trading DB; --dir defaults to pi_data which
+# on the Pi is the live log directory (symlink or bind) — adjust if logs live elsewhere.
+ExecStart=/home/defectuous/StockTipsBot/.venv/bin/python tools/store_daily_bars.py --dir . --db market_data.db
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
