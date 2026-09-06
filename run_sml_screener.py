@@ -1,12 +1,13 @@
 """
 SML screener — real-time WebSocket position monitoring with REST scan loop.
 
-Small-cap most-active + HOD-breakout screener ($0.50–$5.00 default range).
-WebSocket upgrade of the old polling loop — same backend/gates, async fill
-detection, but a different entry strategy on purpose: SML runs HOD-breakout
-(bot/screener.py:_detect_hod_breakout), SML2 runs RSI/MACD/VWAP, so the two
-remain an A/B test of strategies (not just tuning knobs on one shared
-signal) as of 2026-08-20.
+Small-cap most-active + MACD/RSI screener ($0.50–$5.00 default range).
+Same RSI/MACD/VWAP entry signal as SML2 (bot/screener.py:_analyze) — as of
+2026-09-05 SML no longer runs HOD-breakout. The A/B split is now the
+loss-avoidance filter stack below: SML applies it, SML2 runs the same
+signal unfiltered, so the two isolate what those filters are worth.
+Filters derived from tools/analyze (2026-09-05 review of 156 live trades) —
+see memory project_bad_trade_filters_analysis.
 
 WebSocket improvements over the polling version:
 
@@ -73,11 +74,28 @@ Config (env vars or .env):
   MAX_RVOL                skip buys with RVOL above this           default: 0 (off)
   MIN_RVOL                skip buys with RVOL below this           default: 2.0
   MIN_CHANGE_PCT          skip buys flat/red on the day below this default: 2.0
-  HOD_CONSOL_BARS         # of 1-min bars checked for a tight       default: 5
-                          consolidation just below HOD before a
-                          breakout counts
-  HOD_CONSOL_RANGE_PCT    max high-low range (% of consol high)     default: 2.0
-                          allowed in that consolidation window
+  RSI_ENTRY_MIN           skip buys with RSI below this            default: 60
+  RSI_ENTRY_MAX           skip buys with RSI above this            default: 70
+  MACD_MIN_BARS_ABOVE_SIGNAL  skip buys where MACD crossed above   default: 3
+                          signal fewer than this many 15-min bars
+                          ago. Override with SML_MACD_MIN_BARS_ABOVE_SIGNAL.
+
+  SML loss-avoidance filter stack (SML-only; each 0/"" = off):
+  SML_START_TIME_ET       no scan before this time ET (overrides   default: 10:00
+                          shared START_TIME_ET for SML) — pre-10:00
+                          entries ran -$218 net / 23% win in review
+  SML_MIN_PRICE           skip buys below this share price         default: 1.50
+                          (sub-$1.50 entries: -$187 net / 15% win)
+  SML_MAX_RVOL            skip buys with time-adj RVOL above this   default: 6
+                          (overrides shared MAX_RVOL for SML)
+  SML_MAX_EXT_ABOVE_10D_LOW_PCT  skip if price is > this % above    default: 50
+                          the lowest low of the last 10 sessions
+  SML_MAX_RUNUP_5D_PCT    skip if price is up > this % vs the       default: 40
+                          close 5 completed sessions ago
+  SML_MAX_CONSEC_GREEN_DAYS  skip if the stock closed green this    default: 1
+                          many consecutive sessions or more
+  SML_MIN_AVG_DOLLAR_VOL  skip if 20-session avg dollar volume      default: 2000000
+                          (close x volume) is below this
 """
 import asyncio
 import logging
@@ -115,10 +133,10 @@ from bot.database import (
 )
 from bot.discord_notify import send_alert, send_close, send_error
 from bot.logging_utils import configure_logging
-from bot.market_data import _rsi_series, _rvol_time_adjusted, estimate_entry_indicators, vwap_reclaim_exit_price
+from bot.market_data import _rsi_series, _rvol_time_adjusted, daily_context, estimate_entry_indicators, vwap_reclaim_exit_price
 from bot.most_active import get_most_active_penny_stocks
 from bot.resilient_stream import ResilientTradingStream as TradingStream
-from bot.screener import _detect_hod_breakout
+from bot.screener import _analyze
 from bot.trader import Trader
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
@@ -143,7 +161,11 @@ PROFIT_LOCK_PCT  = float(os.getenv("PROFIT_LOCK_PCT",         "50"))
 TIGHT_STOP_PCT   = float(os.getenv("TIGHT_STOP_PCT",          "5"))
 RSI_EXIT_LEVEL   = float(os.getenv("RSI_EXIT_LEVEL",          "75"))
 MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES",          "120"))
-START_TIME_ET    = os.getenv("START_TIME_ET",                 "")
+# SML-only start override (loss-avoidance filter #1) — SML sits out the open,
+# which historically produced its worst trades; shared START_TIME_ET still
+# applies to SML2/MID/SUPER.
+_start_override  = os.getenv("SML_START_TIME_ET")
+START_TIME_ET    = _start_override if _start_override is not None else os.getenv("START_TIME_ET", "10:00")
 _stop_buy_override = os.getenv("SML_STOP_BUY_TIME_ET")
 if _stop_buy_override is None:
     STOP_BUY_TIME_ET = os.getenv("STOP_BUY_TIME_ET", "")
@@ -159,11 +181,27 @@ ATR_MIN_STOP_PCT = float(os.getenv("ATR_MIN_STOP_PCT",        "2.0"))   # floor 
 ATR_MAX_STOP_PCT = float(os.getenv("ATR_MAX_STOP_PCT",        "10.0"))  # ceiling — never let a high-ATR read blow the stop out past this
 MAX_ENTRY_MOVE_PCT = float(os.getenv("SML_MAX_ENTRY_MOVE_PCT") or os.getenv("MAX_ENTRY_MOVE_PCT", "0"))
 MAX_ATR          = float(os.getenv("MAX_ATR",                 "0"))
-MAX_RVOL         = float(os.getenv("MAX_RVOL",                "0"))
+# SML uses a tighter RVOL ceiling than the shared MAX_RVOL (loss-avoidance
+# filter) — RVOL > 6 at entry ran 7% win / -$78 net in the 2026-09-05 review.
+MAX_RVOL         = float(os.getenv("SML_MAX_RVOL") or os.getenv("MAX_RVOL", "6"))
 MIN_RVOL         = float(os.getenv("MIN_RVOL",                "2.0"))
 MIN_CHANGE_PCT   = float(os.getenv("MIN_CHANGE_PCT",           "2.0"))
-HOD_CONSOL_BARS      = int(os.getenv("HOD_CONSOL_BARS",       "5"))
-HOD_CONSOL_RANGE_PCT = float(os.getenv("HOD_CONSOL_RANGE_PCT", "2.0"))
+RSI_ENTRY_MIN    = float(os.getenv("RSI_ENTRY_MIN",            "60"))
+RSI_ENTRY_MAX    = float(os.getenv("RSI_ENTRY_MAX",            "70"))
+MACD_MIN_BARS_ABOVE_SIGNAL = int(
+    os.getenv("SML_MACD_MIN_BARS_ABOVE_SIGNAL")
+    or os.getenv("MACD_MIN_BARS_ABOVE_SIGNAL", "3")
+)
+# ── SML loss-avoidance filter stack (2026-09-05 review; each 0 = off) ────────
+SML_MIN_PRICE              = float(os.getenv("SML_MIN_PRICE",              "1.50"))
+SML_MAX_EXT_ABOVE_10D_LOW_PCT = float(os.getenv("SML_MAX_EXT_ABOVE_10D_LOW_PCT", "50"))
+SML_MAX_RUNUP_5D_PCT      = float(os.getenv("SML_MAX_RUNUP_5D_PCT",       "40"))
+SML_MAX_CONSEC_GREEN_DAYS = int(os.getenv("SML_MAX_CONSEC_GREEN_DAYS",    "1"))
+SML_MIN_AVG_DOLLAR_VOL    = float(os.getenv("SML_MIN_AVG_DOLLAR_VOL",     "2000000"))
+_SML_DAILY_FILTERS_ON = any((
+    SML_MAX_EXT_ABOVE_10D_LOW_PCT > 0, SML_MAX_RUNUP_5D_PCT > 0,
+    SML_MAX_CONSEC_GREEN_DAYS > 0, SML_MIN_AVG_DOLLAR_VOL > 0,
+))
 MIN_GAIN_AT_30M  = float(os.getenv("MIN_GAIN_AT_30M",          "-2.0"))
 MIN_GAIN_AT_60M  = float(os.getenv("MIN_GAIN_AT_60M",          "0.0"))
 VWAP_RECLAIM_DWELL_MIN  = int(os.getenv("VWAP_RECLAIM_DWELL_MIN",  "9"))  # 0 = off
@@ -175,6 +213,7 @@ PROVIDER = f"{SCREENER_ID}_SCREENER"
 _1MIN  = TimeFrame(1,  TimeFrameUnit.Minute)
 _5MIN  = TimeFrame(5,  TimeFrameUnit.Minute)
 _15MIN = TimeFrame(15, TimeFrameUnit.Minute)
+_DAY   = TimeFrame.Day
 
 # ── Shared streaming state ────────────────────────────────────────────────────
 
@@ -919,18 +958,37 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
         logger.warning("5-min bar fetch failed: %s", e)
         bars5 = {}
 
-    # Market-open-anchored 1-min bars — HOD and the pre-breakout consolidation
-    # window are measured off these (see bot/screener.py:_detect_hod_breakout).
+    # Market-open-anchored 5-min bars — used only for VWAP, so VWAP reflects the
+    # full session rather than the short rolling bars5 window above.
     try:
-        bars1_open = data_client.get_stock_bars(StockBarsRequest(
+        bars5_vwap = data_client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=symbols,
-            timeframe=_1MIN,
+            timeframe=_5MIN,
             start=market_open.astimezone(pytz.UTC),
             end=now,
         )).data
     except Exception as e:
-        logger.warning("1-min bar fetch failed: %s", e)
-        bars1_open = {}
+        logger.warning("VWAP bar fetch failed: %s", e)
+        bars5_vwap = {}
+
+    # Daily bars for the SML loss-avoidance filters (10-day-low extension,
+    # 5-day run-up, consecutive-green-days, 20-day avg dollar volume). One
+    # batched request; 40 calendar days back guarantees >= 20 completed
+    # sessions. Skipped entirely when every daily filter is off.
+    bars_day: dict = {}
+    if _SML_DAILY_FILTERS_ON:
+        try:
+            bars_day = data_client.get_stock_bars(StockBarsRequest(
+                symbol_or_symbols=symbols,
+                timeframe=_DAY,
+                start=(now_et - timedelta(days=40)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                ).astimezone(pytz.UTC),
+                end=now,
+            )).data
+        except Exception as e:
+            logger.warning("daily bar fetch failed: %s", e)
+            bars_day = {}
 
     # Midnight-anchored, not "now minus 3 days" — _rvol_time_adjusted needs each
     # prior trading day's bars from ITS OWN market open, but a fetch pinned to
@@ -961,20 +1019,19 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
     passing = []
     for sym in symbols:
         price, chg = price_map[sym]
-        result = _detect_hod_breakout(
+        result = _analyze(
             sym,
-            list(bars1_open.get(sym, [])),
+            list(bars5.get(sym,  [])),
+            list(bars15.get(sym, [])),
             price,
             chg or 0.0,
-            bars_5m=list(bars5.get(sym, [])),
-            consol_bars=HOD_CONSOL_BARS,
-            consol_range_pct_max=HOD_CONSOL_RANGE_PCT,
+            vwap_bars=list(bars5_vwap.get(sym, [])),
         )
-        if result:
+        if result and result.passes:
             passing.append(result)
 
     logger.info(
-        "[%s] Scanned %d stocks -> %d passing HOD breakout  pos=%d/%d  buy=$%.2f",
+        "[%s] Scanned %d stocks -> %d passing MACD+RSI  pos=%d/%d  buy=$%.2f",
         ts, len(symbols), len(passing), open_count, MAX_POSITIONS, buy_amount,
     )
 
@@ -1009,6 +1066,47 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             logger.info("  SKIP  %s — change %.2f%% < %.1f%% min", sym, stock.change_pct or 0.0, MIN_CHANGE_PCT)
             continue
 
+        if not (RSI_ENTRY_MIN <= stock.rsi <= RSI_ENTRY_MAX):
+            logger.info("  SKIP  %s — RSI %.1f outside entry band %.0f-%.0f",
+                        sym, stock.rsi, RSI_ENTRY_MIN, RSI_ENTRY_MAX)
+            continue
+
+        if MACD_MIN_BARS_ABOVE_SIGNAL > 0 and stock.macd_bars_above_signal < MACD_MIN_BARS_ABOVE_SIGNAL:
+            logger.info("  SKIP  %s — MACD crossover too fresh (%d bars < %d min)",
+                        sym, stock.macd_bars_above_signal, MACD_MIN_BARS_ABOVE_SIGNAL)
+            continue
+
+        # ── SML loss-avoidance filter stack (2026-09-05 review) ──────────────
+        if SML_MIN_PRICE > 0 and stock.price < SML_MIN_PRICE:
+            logger.info("  SKIP  %s — price $%.2f < $%.2f min", sym, stock.price, SML_MIN_PRICE)
+            continue
+
+        if _SML_DAILY_FILTERS_ON:
+            dctx = daily_context(list(bars_day.get(sym, [])), now_et)
+            if dctx is None:
+                logger.info("  SKIP  %s — daily context unavailable (need >= 6 completed sessions)", sym)
+                continue
+            if SML_MAX_EXT_ABOVE_10D_LOW_PCT > 0:
+                ext_pct = (stock.price - dctx["low_10d"]) / dctx["low_10d"] * 100
+                if ext_pct > SML_MAX_EXT_ABOVE_10D_LOW_PCT:
+                    logger.info("  SKIP  %s — %.0f%% above 10-day low $%.2f (max %.0f%%)",
+                                sym, ext_pct, dctx["low_10d"], SML_MAX_EXT_ABOVE_10D_LOW_PCT)
+                    continue
+            if SML_MAX_RUNUP_5D_PCT > 0 and dctx["close_5d_ago"]:
+                runup = (stock.price - dctx["close_5d_ago"]) / dctx["close_5d_ago"] * 100
+                if runup > SML_MAX_RUNUP_5D_PCT:
+                    logger.info("  SKIP  %s — up %.0f%% in 5 sessions (max %.0f%%)",
+                                sym, runup, SML_MAX_RUNUP_5D_PCT)
+                    continue
+            if SML_MAX_CONSEC_GREEN_DAYS > 0 and dctx["consec_green_days"] > SML_MAX_CONSEC_GREEN_DAYS:
+                logger.info("  SKIP  %s — %d consecutive green sessions (max %d)",
+                            sym, dctx["consec_green_days"], SML_MAX_CONSEC_GREEN_DAYS)
+                continue
+            if SML_MIN_AVG_DOLLAR_VOL > 0 and dctx["avg_dollar_vol_20d"] < SML_MIN_AVG_DOLLAR_VOL:
+                logger.info("  SKIP  %s — 20-day avg $-vol $%.0f < $%.0f min",
+                            sym, dctx["avg_dollar_vol_20d"], SML_MIN_AVG_DOLLAR_VOL)
+                continue
+
         rvol_ta = _rvol_time_adjusted(list(bars15.get(sym, [])), now_et, symbol=sym)
         if MIN_RVOL > 0 and (rvol_ta is None or rvol_ta < MIN_RVOL):
             if rvol_ta is None:
@@ -1038,12 +1136,10 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             continue
 
         logger.info(
-            "  BUY   %s  $%.4f  HOD=$%.4f (broke +%.2f%%)  consol_range=%.1f%%  vol=%.1fx avg  "
-            "chg=%+.2f%% (min %.1f%%)  RVOL=%.1fx (min %.1fx)  budget=$%.2f  stop=-%.1f%% (ATR-sized)",
-            sym, stock.price, stock.hod, (stock.price / stock.hod - 1) * 100,
-            stock.consol_range_pct, stock.volume_ratio,
-            stock.change_pct, MIN_CHANGE_PCT, rvol_ta or 0.0, MIN_RVOL,
-            sized_amount, stop_pct,
+            "  BUY   %s  $%.4f  RSI=%.1f  chg=%+.2f%% (min %.1f%%)  RVOL=%.1fx (min %.1fx)  "
+            "VWAP=%s  budget=$%.2f  stop=-%.1f%% (ATR-sized)",
+            sym, stock.price, stock.rsi, stock.change_pct, MIN_CHANGE_PCT, rvol_ta or 0.0,
+            MIN_RVOL, "ok" if stock.above_vwap else "fail", sized_amount, stop_pct,
         )
 
         order, err = trader.buy_stock(sym, sized_amount, stock.price)
@@ -1078,8 +1174,10 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
             buy_price            = fill_price,
             buy_time             = datetime.now(timezone.utc),
             buy_order_id         = str(filled.id),
+            rsi_at_entry         = stock.rsi,
             atr_at_entry         = stock.atr,
             change_pct_at_entry  = stock.change_pct,
+            macd_crossover_fresh = stock.macd_crossover,
             rvol_at_entry        = round(rvol_ta, 3) if rvol_ta else None,
             stop_pct_at_entry    = stop_pct,
         )
@@ -1143,7 +1241,7 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
                 symbol         = sym,
                 provider       = PROVIDER,
                 price          = fill_price,
-                rsi            = None,
+                rsi            = stock.rsi,
                 volume         = int(volume_map.get(sym, 0)),
                 momentum       = stock.change_pct,
                 shares_bought  = fill_qty,
@@ -1160,7 +1258,7 @@ def main():
     global _trader
     mode = "PAPER" if ALPACA_PAPER else "LIVE"
     logger.info("=" * 60)
-    logger.info("SML screener starting  [%s]  strategy=hod_breakout", SCREENER_ID)
+    logger.info("SML screener starting  [%s]  strategy=rsi_macd_vwap+loss_filters", SCREENER_ID)
     logger.info(
         "Mode: %s | MaxPos: %d | Reserve: %.0f%% | Stop: %.0f%% | "
         "Lock: +%.0f%%->%.0f%% | RSI exit: %.0f",
@@ -1178,13 +1276,23 @@ def main():
             MIN_MINUTES_TO_DUMP or "off",
         )
     logger.info(
-        "Entry filters: HOD_CONSOL_BARS=%d  HOD_CONSOL_RANGE_PCT=%.1f%%  MIN_RVOL=%.1fx  MAX_RVOL=%s  "
-        "MIN_CHANGE_PCT=%.1f%%  MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  EXCLUDE_SYMBOLS=%s",
-        HOD_CONSOL_BARS, HOD_CONSOL_RANGE_PCT,
+        "Entry filters: MIN_RVOL=%.1fx  MAX_RVOL=%s  MIN_CHANGE_PCT=%.1f%%  "
+        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  RSI_ENTRY=%.0f-%.0f  MACD_MIN_BARS_ABOVE_SIGNAL=%s  EXCLUDE_SYMBOLS=%s",
         MIN_RVOL, MAX_RVOL if MAX_RVOL > 0 else "off", MIN_CHANGE_PCT,
         MAX_ENTRY_MOVE_PCT if MAX_ENTRY_MOVE_PCT > 0 else "off",
         MAX_ATR if MAX_ATR > 0 else "off",
+        RSI_ENTRY_MIN, RSI_ENTRY_MAX,
+        MACD_MIN_BARS_ABOVE_SIGNAL if MACD_MIN_BARS_ABOVE_SIGNAL > 0 else "off",
         ",".join(sorted(EXCLUDE_SYMBOLS)) if EXCLUDE_SYMBOLS else "off",
+    )
+    logger.info(
+        "SML loss filters: START=%s  MIN_PRICE=$%.2f  MAX_RVOL=%.1fx  EXT_ABOVE_10D_LOW=%s%%  "
+        "RUNUP_5D=%s%%  MAX_CONSEC_GREEN=%s  MIN_AVG_$VOL=$%s",
+        START_TIME_ET or "off", SML_MIN_PRICE, MAX_RVOL,
+        SML_MAX_EXT_ABOVE_10D_LOW_PCT if SML_MAX_EXT_ABOVE_10D_LOW_PCT > 0 else "off",
+        SML_MAX_RUNUP_5D_PCT if SML_MAX_RUNUP_5D_PCT > 0 else "off",
+        SML_MAX_CONSEC_GREEN_DAYS if SML_MAX_CONSEC_GREEN_DAYS > 0 else "off",
+        f"{SML_MIN_AVG_DOLLAR_VOL:,.0f}" if SML_MIN_AVG_DOLLAR_VOL > 0 else "off",
     )
     logger.info(
         "Exit rules: HARD_STOP_PCT=%s (resting + polled)  30m>=%.1f%%  60m>=%.1f%%  MAX_HOLD=%dm",

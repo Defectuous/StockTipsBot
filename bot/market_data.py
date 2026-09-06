@@ -288,6 +288,52 @@ def _rvol_time_adjusted(bars15: list, now_et, symbol: str = "") -> Optional[floa
     return round(today_vol / avg_prior, 2)
 
 
+def daily_context(day_bars: list, now_et=None) -> Optional[dict]:
+    """
+    Derive pre-entry daily context for the SML loss-avoidance filters from a
+    list of daily bars (any order). Today's partial bar is dropped so every
+    field reflects only completed sessions.
+
+    Returns None if fewer than 6 completed sessions are available.
+
+      low_10d            lowest low of the last 10 completed sessions
+      close_5d_ago       close 5 completed sessions before the most recent one
+      consec_green_days  # of consecutive up-closes ending at the latest session
+      avg_dollar_vol_20d mean(close x volume) over the last 20 completed sessions
+      prev_close         most recent completed close
+    """
+    et_tz = pytz.timezone("America/New_York")
+    today = (now_et or datetime.now(et_tz)).astimezone(et_tz).date()
+
+    bars = sorted(
+        (b for b in day_bars if b.timestamp.astimezone(et_tz).date() < today),
+        key=lambda b: b.timestamp,
+    )
+    if len(bars) < 6:
+        return None
+
+    closes = [b.close for b in bars]
+    last10 = bars[-10:]
+
+    consec_green = 0
+    for i in range(len(closes) - 1, 0, -1):
+        if closes[i] > closes[i - 1]:
+            consec_green += 1
+        else:
+            break
+
+    win20 = bars[-20:]
+    avg_dollar_vol_20d = sum(b.close * b.volume for b in win20) / len(win20)
+
+    return {
+        "low_10d":            min(b.low for b in last10),
+        "close_5d_ago":       closes[-6],
+        "consec_green_days":  consec_green,
+        "avg_dollar_vol_20d": avg_dollar_vol_20d,
+        "prev_close":         closes[-1],
+    }
+
+
 def estimate_entry_indicators(
     data_client: StockHistoricalDataClient,
     symbol: str,
