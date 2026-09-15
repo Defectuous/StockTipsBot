@@ -30,6 +30,9 @@ Config (env vars or .env):
   BUY_COOLDOWN_SECONDS    min seconds between buys/stock           default: 86400
   SCAN_INTERVAL_SECONDS   seconds between full scans               default: 60
   MONITOR_INTERVAL_SECONDS secs between position checks            default: 10
+  SML2_PRICE_STALENESS_SECONDS (or PRICE_STALENESS_SECONDS)
+                           max age of a cached WS price before
+                           a REST snapshot refresh is forced      default: 45
   ALPACA_PAPER            true / false                             default: true
   DISCORD_WEBHOOK_URL     webhook for buy/error alerts             optional
   PROFIT_LOCK_PCT         gain % to tighten trailing stop          default: 50
@@ -72,6 +75,31 @@ Config (env vars or .env):
                           now requires confirmation instead of
                           freshness. Override with
                           SML2_MACD_MIN_BARS_ABOVE_SIGNAL.
+
+  The 5 settings below (all SML2-only, added 2026-09-15 from the
+  day-agnostic backtest of the post-50%-win-rate review — see
+  tools/backtest_symbols.py --profile and reports/backtest_symbols_*.csv):
+  SML2_DONT_CHASE_PCT     skip buys already up > this %             default: 0 (off)
+                          tighter than MAX_ENTRY_MOVE_PCT — backtested
+                          net NEGATIVE in isolation (clips real
+                          winners like CDTG/PSIG along with true
+                          blowups like SST/AMTX); kept bundled here
+                          because it was explicitly requested — the
+                          exits_only profile (this OFF) backtested
+                          better alone (~$157 vs ~$148 per 57/46
+                          trades @ $250 sizing).
+  SML2_ATR_TRAIL_ACTIVATE_PCT  gain% at which a trailing stop         default: 0 (off)
+                          engages (sized ATR_TRAIL_MULT x ATR%),
+                          replacing reliance on PROFIT_LOCK_PCT
+  SML2_ATR_TRAIL_MULT     trail distance = this x (ATR / entry_price) default: 1.5
+  SML2_RSI_EXIT_MIN_GAIN_PCT  RSI-overbought exit only fires above    default: 0 (off)
+                          this gain% — stops it sniping trades
+                          that are barely green
+  SML2_MIN_GAIN_AT_30M / SML2_MIN_GAIN_AT_60M / SML2_MAX_HOLD_MINUTES /
+  SML2_DUMP_TIME_ET       SML2-specific overrides for the
+                          shared-named checkpoint/hold/dump configs
+                          above, so tuning SML2's exit timing doesn't
+                          also move SML's
 """
 import asyncio
 import logging
@@ -132,11 +160,15 @@ TRAIL_PCT        = float(os.getenv("TRAILING_STOP_PERCENT",   "10"))
 COOLDOWN_SECS    = int(os.getenv("BUY_COOLDOWN_SECONDS",      "86400"))
 SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL_SECONDS",     "60"))
 MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL_SECONDS",  "10"))
+PRICE_STALENESS_SECONDS = float(
+    os.getenv("SML2_PRICE_STALENESS_SECONDS")
+    or os.getenv("PRICE_STALENESS_SECONDS", "45")
+)
 DISCORD_WEBHOOK  = os.getenv("DISCORD_WEBHOOK_URL",           "")
 PROFIT_LOCK_PCT  = float(os.getenv("PROFIT_LOCK_PCT",         "50"))
 TIGHT_STOP_PCT   = float(os.getenv("TIGHT_STOP_PCT",          "5"))
 RSI_EXIT_LEVEL   = float(os.getenv("RSI_EXIT_LEVEL",          "75"))
-MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES",          "120"))
+MAX_HOLD_MINUTES = int(os.getenv("SML2_MAX_HOLD_MINUTES") or os.getenv("MAX_HOLD_MINUTES", "120"))
 START_TIME_ET    = os.getenv("START_TIME_ET",                 "")
 _stop_buy_override = os.getenv("SML2_STOP_BUY_TIME_ET")
 if _stop_buy_override is None:
@@ -145,13 +177,23 @@ elif _stop_buy_override.lower() == "off":
     STOP_BUY_TIME_ET = ""
 else:
     STOP_BUY_TIME_ET = _stop_buy_override
-DUMP_TIME_ET     = os.getenv("DUMP_TIME_ET",                  "")
+DUMP_TIME_ET     = os.getenv("SML2_DUMP_TIME_ET") or os.getenv("DUMP_TIME_ET", "")
 MIN_MINUTES_TO_DUMP = int(os.getenv("SML2_MIN_MINUTES_TO_DUMP") or os.getenv("MIN_MINUTES_TO_DUMP", "0"))
 HARD_STOP_PCT    = float(os.getenv("HARD_STOP_PCT",           "0"))
 ATR_STOP_MULT    = float(os.getenv("ATR_STOP_MULT",           "2.0"))   # stop distance = ATR_STOP_MULT x ATR, when ATR is available
 ATR_MIN_STOP_PCT = float(os.getenv("ATR_MIN_STOP_PCT",        "2.0"))   # floor — never let a low-ATR read produce a near-zero stop
 ATR_MAX_STOP_PCT = float(os.getenv("ATR_MAX_STOP_PCT",        "10.0"))  # ceiling — never let a high-ATR read blow the stop out past this
 MAX_ENTRY_MOVE_PCT = float(os.getenv("SML2_MAX_ENTRY_MOVE_PCT") or os.getenv("MAX_ENTRY_MOVE_PCT", "0"))
+# "Don't-chase" ceiling — tighter than MAX_ENTRY_MOVE_PCT, SML2-only. Added
+# 2026-09-15 from the day-agnostic backtest of the 5 post-50%-win-rate
+# changes (see tools/backtest_symbols.py --profile). Bundled with the ATR
+# trail/checkpoint/RSI-exit changes below to match the "improved" profile
+# tested in reports/backtest_symbols_rsi_macd_improved.csv — note that the
+# exits_only profile (this ceiling OFF) actually backtested better in
+# isolation (~$157 vs ~$148 per 57/46 trades @ $250 sizing, since it clips
+# real winners like CDTG/PSIG along with the SST/AMTX-style blowups); kept
+# here because it was explicitly requested as the bundled config.
+DONT_CHASE_PCT = float(os.getenv("SML2_DONT_CHASE_PCT", "0"))  # 0 = off
 MAX_ATR          = float(os.getenv("MAX_ATR",                 "0"))
 MAX_RVOL         = float(os.getenv("MAX_RVOL",                "0"))
 MIN_RVOL         = float(os.getenv("MIN_RVOL",                "2.0"))
@@ -162,11 +204,22 @@ MACD_MIN_BARS_ABOVE_SIGNAL = int(
     os.getenv("SML2_MACD_MIN_BARS_ABOVE_SIGNAL")
     or os.getenv("MACD_MIN_BARS_ABOVE_SIGNAL", "3")
 )
-MIN_GAIN_AT_30M  = float(os.getenv("MIN_GAIN_AT_30M",          "-2.0"))
-MIN_GAIN_AT_60M  = float(os.getenv("MIN_GAIN_AT_60M",          "0.0"))
+MIN_GAIN_AT_30M  = float(os.getenv("SML2_MIN_GAIN_AT_30M") or os.getenv("MIN_GAIN_AT_30M", "-2.0"))
+MIN_GAIN_AT_60M  = float(os.getenv("SML2_MIN_GAIN_AT_60M") or os.getenv("MIN_GAIN_AT_60M", "0.0"))
 VWAP_RECLAIM_DWELL_MIN  = int(os.getenv("VWAP_RECLAIM_DWELL_MIN",  "9"))  # 0 = off
 VWAP_RECLAIM_WARMUP_MIN = int(os.getenv("VWAP_RECLAIM_WARMUP_MIN", "3"))
 EXCLUDE_SYMBOLS  = {s.strip().upper() for s in os.getenv("EXCLUDE_SYMBOLS", "").split(",") if s.strip()}
+
+# ATR-trail + gain-gated RSI exit — SML2-only, added 2026-09-15 alongside
+# DONT_CHASE_PCT above (see that comment for the backtest context). When
+# ATR_TRAIL_ACTIVATE_PCT > 0, a trade gets NO resting trailing stop until
+# it's up this much, at which point the trail engages at
+# ATR_TRAIL_MULT x (ATR / entry_price) — replacing reliance on
+# PROFIT_LOCK_PCT/TIGHT_STOP_PCT for early-engaging protection. Set to 0 to
+# keep the old behavior (hard stop only until PROFIT_LOCK_PCT).
+ATR_TRAIL_ACTIVATE_PCT = float(os.getenv("SML2_ATR_TRAIL_ACTIVATE_PCT", "0"))  # 0 = off
+ATR_TRAIL_MULT         = float(os.getenv("SML2_ATR_TRAIL_MULT", "1.5"))
+RSI_EXIT_MIN_GAIN_PCT  = float(os.getenv("SML2_RSI_EXIT_MIN_GAIN_PCT", "0"))  # 0 = off
 
 PROVIDER = f"{SCREENER_ID}_SCREENER"
 
@@ -176,8 +229,12 @@ _15MIN = TimeFrame(15, TimeFrameUnit.Minute)
 
 # ── Shared streaming state ────────────────────────────────────────────────────
 
-# Real-time price cache: updated by StockDataStream on every trade tick
+# Real-time price cache: updated by StockDataStream on every trade tick.
+# _price_updated_at tracks when each entry was last refreshed — thin
+# microcaps can go minutes without a print, so a cached price is only
+# trustworthy if it's recent (see monitor_positions).
 _prices: Dict[str, float] = {}
+_price_updated_at: Dict[str, float] = {}
 _prices_lock = threading.Lock()
 
 # Fill notification: main thread registers an Event; TradingStream sets it on fill
@@ -234,6 +291,7 @@ async def _on_trade(data) -> None:
     """StockDataStream trade callback — caches the latest price for each symbol."""
     with _prices_lock:
         _prices[data.symbol] = float(data.price)
+        _price_updated_at[data.symbol] = time.monotonic()
 
 
 async def _on_trade_update(data) -> None:
@@ -332,6 +390,10 @@ def _unsubscribe_prices(symbols: list) -> None:
                 to_drop.append(s)
     if to_drop:
         _data_stream.unsubscribe_trades(*to_drop)
+        with _prices_lock:
+            for s in to_drop:
+                _prices.pop(s, None)
+                _price_updated_at.pop(s, None)
         logger.info("Price stream unsubscribed: %s", to_drop)
 
 
@@ -644,18 +706,31 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
         hard_stop_order_id = pos.get("hard_stop_order_id")
         stop_tightened     = pos.get("stop_tightened", 0)
 
-        # Price from WebSocket cache — updated on every trade tick
+        # Price from WebSocket cache — updated on every trade tick. Thin
+        # microcaps can go quiet for minutes with no print at all, which
+        # would otherwise leave gain_pct silently pinned near the entry
+        # price — so a cache entry older than PRICE_STALENESS_SECONDS is
+        # treated the same as missing.
         with _prices_lock:
             current_price = _prices.get(sym)
+            updated_at    = _price_updated_at.get(sym)
+        stale = updated_at is None or (time.monotonic() - updated_at) > PRICE_STALENESS_SECONDS
 
-        if current_price is None:
-            # Not yet in cache (stream just subscribed); fall back to snapshot
+        if current_price is None or stale:
             try:
                 snap = data_client.get_stock_snapshot(
                     StockSnapshotRequest(symbol_or_symbols=[sym])
                 ).get(sym)
                 if snap and snap.latest_trade:
                     current_price = float(snap.latest_trade.price)
+                    with _prices_lock:
+                        _prices[sym] = current_price
+                        _price_updated_at[sym] = time.monotonic()
+                    if stale and updated_at is not None:
+                        logger.info(
+                            "  %s — price cache stale (%.0fs old), refreshed via snapshot -> $%.4f",
+                            sym, time.monotonic() - updated_at, current_price,
+                        )
             except Exception:
                 pass
 
@@ -795,7 +870,8 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
             if len(rsi_vals) >= 4:
                 rsi         = rsi_vals[-1]
                 rsi_falling = rsi_vals[-1] < rsi_vals[-3]
-                if rsi > RSI_EXIT_LEVEL and rsi_falling:
+                if (rsi > RSI_EXIT_LEVEL and rsi_falling
+                        and gain_pct >= RSI_EXIT_MIN_GAIN_PCT):
                     logger.info(
                         "  RSI EXIT  %s  RSI=%.1f (falling)  gain=%+.1f%%",
                         sym, rsi, gain_pct,
@@ -803,7 +879,41 @@ def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) ->
                     _sell_and_close("RSI overbought exit")
                     continue
 
-        # ── 6. Profit lock ────────────────────────────────────────────────────
+        # ── 5.5. ATR trail activation — engages a trailing stop as soon as a
+        #      trade is ATR_TRAIL_ACTIVATE_PCT green, sized to the stock's own
+        #      volatility (ATR_TRAIL_MULT x ATR%) instead of waiting for
+        #      PROFIT_LOCK_PCT. Shares the stop_tightened flag with step 6 so
+        #      whichever fires first blocks the other from re-tightening. ────
+        if (ATR_TRAIL_ACTIVATE_PCT > 0 and not stop_tightened
+                and gain_pct >= ATR_TRAIL_ACTIVATE_PCT):
+            entry_atr = pos.get("atr_at_entry")
+            if entry_atr:
+                atr_trail_pct = max(ATR_TRAIL_MULT * (entry_atr / buy_price * 100), 0.5)
+                active_stop_id = stop_order_id or hard_stop_order_id
+                logger.info(
+                    "  ATR TRAIL  %s  +%.1f%% -> engaging %.1f%% trail (%.1fx ATR)",
+                    sym, gain_pct, atr_trail_pct, ATR_TRAIL_MULT,
+                )
+                cancelled = trader.cancel_order(active_stop_id) if active_stop_id else True
+                if cancelled:
+                    new_stop = trader.submit_trailing_stop(sym, shares, atr_trail_pct)
+                    if new_stop:
+                        new_id = str(new_stop.id)
+                        mark_stop_tightened(pos_id, new_id)
+                        if hard_stop_order_id:
+                            update_hard_stop_order(pos_id, None)
+                        with _ts_lock:
+                            _ts_to_pos.pop(active_stop_id, None)
+                        _register_stops(pos_id, sym, buy_price, shares, new_id, None)
+                        logger.info("  STOP  %s ATR-trailed to %.1f%%  id=%s",
+                                    sym, atr_trail_pct, new_id)
+                        stop_tightened = True
+                else:
+                    logger.warning("  ATR TRAIL  %s — cancel failed, keeping original stop", sym)
+
+        # ── 6. Profit lock — no-op once ATR trail (or this itself) has already
+        #      tightened the stop once; kept as a fallback for when
+        #      ATR_TRAIL_ACTIVATE_PCT is 0/off. ────────────────────────────────
         if not stop_tightened and gain_pct >= PROFIT_LOCK_PCT:
             # Whichever stop type is currently resting (trailing or hard —
             # they're mutually exclusive, see entry logic) gets cancelled and
@@ -989,6 +1099,11 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
         if MAX_ENTRY_MOVE_PCT > 0 and stock.change_pct > MAX_ENTRY_MOVE_PCT:
             logger.info("  SKIP  %s — already up %.1f%% (limit %.0f%%)",
                         sym, stock.change_pct, MAX_ENTRY_MOVE_PCT)
+            continue
+
+        if DONT_CHASE_PCT > 0 and stock.change_pct > DONT_CHASE_PCT:
+            logger.info("  SKIP  %s — don't-chase: up %.1f%% (limit %.0f%%)",
+                        sym, stock.change_pct, DONT_CHASE_PCT)
             continue
 
         if MAX_ATR > 0 and stock.atr and stock.atr > MAX_ATR:
@@ -1179,18 +1294,23 @@ def main():
         )
     logger.info(
         "Entry filters: MIN_RVOL=%.1fx  MAX_RVOL=%s  MIN_CHANGE_PCT=%.1f%%  "
-        "MAX_ENTRY_MOVE_PCT=%s  MAX_ATR=%s  RSI_ENTRY=%.0f-%.0f  MACD_MIN_BARS_ABOVE_SIGNAL=%s  EXCLUDE_SYMBOLS=%s",
+        "MAX_ENTRY_MOVE_PCT=%s  DONT_CHASE_PCT=%s  MAX_ATR=%s  RSI_ENTRY=%.0f-%.0f  "
+        "MACD_MIN_BARS_ABOVE_SIGNAL=%s  EXCLUDE_SYMBOLS=%s",
         MIN_RVOL, MAX_RVOL if MAX_RVOL > 0 else "off", MIN_CHANGE_PCT,
         MAX_ENTRY_MOVE_PCT if MAX_ENTRY_MOVE_PCT > 0 else "off",
+        DONT_CHASE_PCT if DONT_CHASE_PCT > 0 else "off",
         MAX_ATR if MAX_ATR > 0 else "off",
         RSI_ENTRY_MIN, RSI_ENTRY_MAX,
         MACD_MIN_BARS_ABOVE_SIGNAL if MACD_MIN_BARS_ABOVE_SIGNAL > 0 else "off",
         ",".join(sorted(EXCLUDE_SYMBOLS)) if EXCLUDE_SYMBOLS else "off",
     )
     logger.info(
-        "Exit rules: HARD_STOP_PCT=%s (resting + polled)  30m>=%.1f%%  60m>=%.1f%%  MAX_HOLD=%dm",
+        "Exit rules: HARD_STOP_PCT=%s (resting + polled)  30m>=%.1f%%  60m>=%.1f%%  MAX_HOLD=%dm  "
+        "RSI_EXIT_MIN_GAIN=%s  ATR_TRAIL: %s",
         HARD_STOP_PCT if HARD_STOP_PCT > 0 else "off",
         MIN_GAIN_AT_30M, MIN_GAIN_AT_60M, MAX_HOLD_MINUTES,
+        f"{RSI_EXIT_MIN_GAIN_PCT:.0f}%" if RSI_EXIT_MIN_GAIN_PCT > 0 else "off",
+        f"activate>=+{ATR_TRAIL_ACTIVATE_PCT:.1f}% @ {ATR_TRAIL_MULT:.1f}x ATR" if ATR_TRAIL_ACTIVATE_PCT > 0 else "off",
     )
     logger.info("=" * 60)
 
