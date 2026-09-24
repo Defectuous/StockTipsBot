@@ -1,5 +1,67 @@
 # TODO
 
+## Backtest fidelity fixes + SML2 retune — 2026-09-23
+
+- [x] **Found and fixed 5 biases in `tools/backtest_sml2.py`** (all opt-in flags,
+      default off so older studies reproduce; `backtest_stop_floor.LIVE_SML2`
+      turns them all on):
+        - `NO_LOOKAHEAD`: entry gates saw the still-forming 5/15-min bar's final
+          OHLC (Alpaca labels bars by start time), up to 14 min of the future.
+        - `REALISTIC_STOP_FILLS`: stops filled exactly at the trigger with a
+          low-before-high intrabar order. On 14 live-config SML2 trades the sim
+          read 30 pts too good; now about 7 pts (paper fills still land below
+          IEX bar lows).
+        - `MACD_MIN_BARS_ABOVE_SIGNAL=3`: resim required a fresh crossover; live doesn't.
+        - `LIVE_RVOL_LOOKBACK`: resim still had the 3-day RVOL window (the
+          Monday RVOL=None bug fixed live 08-17). The bar cache now holds 7 days.
+        - `ENTRY_START_TIME_ET`: rsi_macd resim never enforced the 09:45 start.
+      With the fixes the resim reproduces all 6 live SML2 entries Sep 21–23.
+      **Pre-09-23 conclusions from this tool are suspect**, including the
+      09-20 entry below: its "+50.6% at 4x" came from the biased resim.
+- [x] **Optimizer** (`tools/backtest_optimize.py`, coordinate ascent; a change
+      must improve both the pre- and post-08-25 halves). Current SML2 was −$35
+      (39 trades, 38.5% win). ATR trail off → +$47. Plus MAX_RVOL 4 → +$96
+      (28 trades, 46.4% win). The 3x cap scored +$108 on only 23 trades and was
+      skipped as overfit. The 3% stop floor was rejected
+      (`tools/backtest_stop_floor.py`).
+- [x] **Applied:** `SML2_ATR_TRAIL_ACTIVATE_PCT=0`, new `SML2_MAX_RVOL=4`
+      (added the override in `run_sml2_screener.py`). `.env` and the code are
+      on the Pi (code copied 09-24, old copy saved as `run_sml2_screener.py.bak.20260924`).
+- [ ] **Restart `screener-sml2` on the Pi** (needs sudo). Confirm the banner shows
+      `MAX_RVOL=4.0` and `ATR_TRAIL: off` (trail-off was already confirmed at
+      the 09-24 02:13 restart; MAX_RVOL was still 10 because the code hadn't been copied yet).
+- [ ] Review SML2 after 2–3 weeks on the new config: judge per-trade results,
+      and expect about 25–30% fewer trades.
+
+## SML_MAX_RVOL tightened 6 -> 4 — 2026-09-20
+
+- [x] **Set `SML_MAX_RVOL=4` in `.env`** (was 6; live on the Pi per the 09-20 16:26 banner. NOTE 09-23: the resim numbers below were inflated by lookahead bias. On the corrected tool the cap still helps, but by cutting losses rather than creating an edge), based on new backtest tooling
+      (`tools/backtest_filter_sweep.py`, `tools/backtest_equity_sim.py`) built
+      this session to test 4 candidate ideas from external strategy research
+      (see memory `project_strategy_research_2026-09-20`) against real
+      SML/SML2 trade history. Of the four (VWAP slope filter, opening-range-
+      width gate, MAX_RVOL cap, VWAP-reclaim entry), only the RVOL cap showed
+      real edge — swept {3,4,5,6,8,10} against a 45-day/25-entry rsi_macd
+      resim: 4.0 was the standout (60.0% win / +2.53% avg / +50.6% total,
+      n=20/25 kept) vs. 6.0's own resim (52.2%/+1.97%/+45.2%). Confirmed with
+      a real $-equity walk (actual ATR-based position sizing, 2-slot cap,
+      reinvestment) over the same ~13-week window: $500->$623 at 4.0 vs.
+      $500->$589 uncapped.
+        - Other three rejected: VWAP slope filter hurt at every threshold
+          tested; opening-range-width gate showed no clean win and actually
+          contradicted the earlier "wide opening range" leak finding at this
+          sample size; VWAP-reclaim entry (new `simulate_entry_vwap_reclaim`
+          in backtest_sml2.py) underperformed rsi_macd baseline even at
+          n=11 fires (36.4% win, -6.4% total).
+        - **Caveat: still only n=17-25 trades, not independent (SML/SML2
+          often trade the same symbol same day)** — same thin-sample caveat
+          as the VWAP-reclaim-exit dwell tuning. Treat as promising, not
+          proven.
+      **Action item: sync `.env` to the Pi and restart `screener-sml`
+      (not `screener-sml2` — SML2 stays the unfiltered control arm) for this
+      to actually take effect live** — no SSH/network access to the Pi from
+      this machine, so only the local `.env` was changed.
+
 ## From 2026-08-17 daily review (no trades today)
 
 - [x] **RVOL bug — fully root-caused and fixed 2026-08-17 (not a feed-lag

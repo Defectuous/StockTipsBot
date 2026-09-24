@@ -52,6 +52,7 @@ import sqlite3
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -61,7 +62,7 @@ from alpaca.data import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-from bot.market_data import _rsi_series, _rvol_time_adjusted
+from bot.market_data import _rsi_series, _rvol_time_adjusted, _vwap
 from bot.screener import _analyze, _detect_hod_breakout
 
 load_dotenv()
@@ -93,6 +94,20 @@ MAX_ATR          = float(os.getenv("MAX_ATR", "0"))
 RSI_ENTRY_MIN    = float(os.getenv("RSI_ENTRY_MIN", "60"))
 RSI_ENTRY_MAX    = float(os.getenv("RSI_ENTRY_MAX", "70"))
 REQUIRE_MACD_FRESH_CROSSOVER = os.getenv("REQUIRE_MACD_FRESH_CROSSOVER", "true").lower() == "true"
+# Live SML2 doesn't require a fresh crossover — it requires MACD to have been
+# above signal for >= N bars (run_sml2_screener.py MACD_MIN_BARS_ABOVE_SIGNAL=3).
+# 0 = off (legacy behavior); live-fidelity runs set this to 3 and turn
+# REQUIRE_MACD_FRESH_CROSSOVER off.
+MACD_MIN_BARS_ABOVE_SIGNAL = 0
+# Live fetches 15-min bars (MACD + RVOL) from midnight 7 days back (the
+# 2026-08-17 Monday/post-holiday RVOL=None fix). The legacy window here was
+# "now minus 3 days", which reproduces that exact bug. True = live window.
+LIVE_RVOL_LOOKBACK = False
+# rsi_macd entry never enforced START_TIME_ET (only the vwap_reclaim entry
+# did), so it could take 09:30-09:44 entries live SML2 has skipped since
+# 2026-07-30. None = legacy (no gate); live-fidelity runs set "09:45".
+ENTRY_START_TIME_ET: str | None = None
+MIN_ENTRY_PRICE = 0.0   # SML-style min-price filter for sweeps; 0 = off
 
 # hod strategy only (SML2's entry gate from 2026-08-20)
 HOD_CONSOL_BARS      = int(os.getenv("HOD_CONSOL_BARS", "5"))
@@ -127,6 +142,63 @@ ATR_TRAIL_MULT         = 1.5   # trail distance once active = ATR_TRAIL_MULT x (
 RSI_EXIT_MIN_GAIN_PCT  = 0.0   # improved: 5.0 — don't let the RSI-overbought exit fire on a
                                 # trade that's barely green (EMPD sold at +0.8% the moment RSI
                                 # ran hot — exactly when a momentum trade should be working)
+
+# ── Live-fidelity exit options (2026-09-23) — both default off so existing
+# callers are unchanged. Live SML2 doesn't rest a flat HARD_STOP_PCT stop: it
+# uses run_sml2_screener.py:_size_by_risk's ATR-sized stop, clamped to
+# [ATR_MIN_STOP_PCT, ATR_MAX_STOP_PCT], and runs the VWAP-reclaim early exit
+# (bot/market_data.py:vwap_reclaim_exit_price) ahead of the time checkpoints.
+ATR_HARD_STOP            = False  # True = hard stop = clamp(ATR_STOP_MULT x ATR%, min, max)
+ATR_STOP_MULT            = 2.0
+ATR_MIN_STOP_PCT         = 2.0
+ATR_MAX_STOP_PCT         = 10.0
+VWAP_RECLAIM_EXIT_DWELL  = 0      # live: 9 — consecutive 1-min closes below VWAP AND entry; 0 = off
+VWAP_RECLAIM_EXIT_WARMUP = 3      # live: 3 — minutes after entry ignored by the reclaim check
+
+# ── Lookahead fix (2026-09-23). Alpaca labels bars by START time, so filtering
+# 5/15-min bars on `timestamp <= ts` hands the gate the still-forming bar's
+# FINAL OHLC — up to 4 (5-min) / 14 (15-min) minutes of the future — while
+# the entry price is the current 1-min close. When True, that forming bar is
+# rebuilt from 1-min bars up to the decision time instead, which matches what
+# live sees (Alpaca returns the partial bar as of now, never beyond it).
+NO_LOOKAHEAD = False
+
+# Stop-fill realism (2026-09-23): 1-min bars can't show whether a bar's high
+# or low came first, and the original model always assumed low-first (most
+# favorable for a trailing stop). Checked against 14 live SML2 trades on the
+# current exit config, that made trail exits read ~30 points too good in
+# aggregate (XRTX sim +24.8% vs actual +6.2%, VHUB -0.1% vs -7.1%). When True:
+# gap-through stops fill at the bar open, and a new-high bar that also trades
+# down through the trail stops out within that bar.
+REALISTIC_STOP_FILLS = False
+
+# Breakeven floor under the ATR trail (2026-09-23 proposal): once the trail
+# is active, the stop never sits below entry (+ offset). Live would enforce
+# this from the monitor loop (Alpaca can't hold a hard stop and a trailing
+# stop on the same shares), so this is slightly optimistic on fill timing.
+ATR_TRAIL_BE_FLOOR = False
+ATR_TRAIL_BE_OFFSET_PCT = 0.0
+
+# ── Candidate filters from 2026-09-20 strategy research (see memory
+# project_strategy_research_2026-09-20) — all default to 0/off so importing
+# this module changes no existing behavior. Only rsi_macd entry consumes
+# these two; vwap_reclaim is a separate entry strategy entirely.
+VWAP_SLOPE_MIN_PCT        = 0.0   # min required rise in VWAP over the lookback window, as a
+                                    # % of the earlier VWAP value; 0 = off, negative = disallowed
+VWAP_SLOPE_LOOKBACK_MIN   = 15     # window over which slope is measured
+OPENING_RANGE_MAX_PCT     = 0.0    # max allowed (high-low)/low over the opening window, as a %;
+                                    # 0 = off. "Wide opening range" was flagged as a loss leak in
+                                    # project_bad_trade_filters_analysis.
+OPENING_RANGE_MINUTES     = 15     # opening window width, anchored to 09:30 ET
+
+# ── vwap_reclaim entry strategy params (mirrors the live VWAP-reclaim EXIT's
+# dwell=9 tuning in spirit — symmetric "sustained break, not a single wobble"
+# requirement — see project_vwap_reclaim_exit)
+VWAP_RECLAIM_FADE_MIN          = 15    # consecutive 1-min closes below VWAP required immediately
+                                         # before the reclaim bar, to count as a real fade+consolidate
+VWAP_RECLAIM_VOL_MULT          = 2.0   # reclaim bar volume must be >= this x the preceding
+                                         # consolidation window's average 1-min volume
+VWAP_RECLAIM_CONSOL_LOOKBACK_MIN = 15  # window used to compute the consolidation baseline volume
 
 PROVIDER_MAP = {"sml": "SML_SCREENER", "sml2": "SML2_SCREENER"}
 
@@ -174,7 +246,11 @@ def fetch_symbol_data(client: StockHistoricalDataClient, symbol: str, d: date,
     if use_cache and cache_path.exists():
         try:
             with open(cache_path, "rb") as f:
-                return pickle.load(f)
+                cached = pickle.load(f)
+            # Entries cached before 2026-09-23 only hold 4 days of 15-min
+            # bars; refetch so LIVE_RVOL_LOOKBACK has its 7-day window.
+            if cached is None or cached.get("bars15_days") == 7:
+                return cached
         except Exception:
             pass  # corrupt cache entry — fall through and refetch
 
@@ -193,7 +269,8 @@ def fetch_symbol_data(client: StockHistoricalDataClient, symbol: str, d: date,
         )).data.get(symbol, []))
         bars15 = list(client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=symbol, timeframe=_15MIN,
-            start=(day_start_et - timedelta(days=4)).astimezone(pytz.UTC), end=day_end_et.astimezone(pytz.UTC),
+            start=(day_start_et - timedelta(days=7)).replace(hour=0, minute=0).astimezone(pytz.UTC),
+            end=day_end_et.astimezone(pytz.UTC),
         )).data.get(symbol, []))
         daily = list(client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=symbol, timeframe=TimeFrame.Day,
@@ -221,7 +298,35 @@ def fetch_symbol_data(client: StockHistoricalDataClient, symbol: str, d: date,
     if prev_close is None:
         return _save(None)
 
-    return _save(dict(bars1=bars1, bars5=bars5, bars15=bars15, prev_close=prev_close))
+    return _save(dict(bars1=bars1, bars5=bars5, bars15=bars15, prev_close=prev_close,
+                      bars15_days=7))
+
+
+def _b15_start(ts_et: datetime) -> datetime:
+    if LIVE_RVOL_LOOKBACK:
+        return (ts_et - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return ts_et - timedelta(days=3)
+
+
+def _asof(bars: list, bar_min: int, ts_et: datetime, bars1: list) -> list:
+    """Bars as live would see them at the close of the 1-min bar starting at
+    ts_et: completed bars unchanged, the forming bar rebuilt from bars1."""
+    decided_at = ts_et + timedelta(minutes=1)
+    out = []
+    for b in bars:
+        start = b.timestamp.astimezone(_ET)
+        if start > ts_et:
+            break
+        if start + timedelta(minutes=bar_min) <= decided_at:
+            out.append(b)
+            continue
+        parts = [m for m in bars1 if start <= m.timestamp.astimezone(_ET) <= ts_et]
+        if parts:
+            out.append(SimpleNamespace(
+                timestamp=b.timestamp, open=parts[0].open, close=parts[-1].close,
+                high=max(m.high for m in parts), low=min(m.low for m in parts),
+                volume=sum(m.volume for m in parts)))
+    return out
 
 
 def simulate_entry_rsi_macd(symbol: str, data: dict, d: date) -> dict | None:
@@ -237,22 +342,52 @@ def simulate_entry_rsi_macd(symbol: str, data: dict, d: date) -> dict | None:
         ts_et = bar.timestamp.astimezone(_ET)
         if ts_et >= stop_buy:
             break
+        if ENTRY_START_TIME_ET and ts_et < _ET.localize(datetime.combine(d, _parse_hm(ENTRY_START_TIME_ET))):
+            continue
 
         price = bar.close
+        if MIN_ENTRY_PRICE and price < MIN_ENTRY_PRICE:
+            continue
         change_pct = round((price - prev_close) / prev_close * 100, 2) if prev_close else 0.0
 
+        b5_seen = _asof(bars5, 5, ts_et, bars1) if NO_LOOKAHEAD else bars5
+        b15_seen = _asof(bars15, 15, ts_et, bars1) if NO_LOOKAHEAD else bars15
         # Rolling 120-min window for RSI/ATR (mirrors the live "now-120min" fetch)
         window_start = ts_et - timedelta(minutes=120)
-        b5_window = [b for b in bars5 if window_start <= b.timestamp.astimezone(_ET) <= ts_et]
+        b5_window = [b for b in b5_seen if window_start <= b.timestamp.astimezone(_ET) <= ts_et]
         # Market-open-anchored window for VWAP
-        b5_vwap = [b for b in bars5 if market_open <= b.timestamp.astimezone(_ET) <= ts_et]
+        b5_vwap = [b for b in b5_seen if market_open <= b.timestamp.astimezone(_ET) <= ts_et]
         # 3-calendar-day trailing window for MACD/RVOL
-        b15_window = [b for b in bars15
-                      if (ts_et - timedelta(days=3)) <= b.timestamp.astimezone(_ET) <= ts_et]
+        b15_window = [b for b in b15_seen
+                      if _b15_start(ts_et) <= b.timestamp.astimezone(_ET) <= ts_et]
 
         stock = _analyze(symbol, b5_window, b15_window, price, change_pct, vwap_bars=b5_vwap)
         if not stock or not stock.passes:
             continue
+
+        # ── Diagnostics, always computed (used for both gating, when the
+        # matching *_MIN_PCT/*_MAX_PCT is set, and bucket analysis when not) ─
+        slope_cutoff = ts_et - timedelta(minutes=VWAP_SLOPE_LOOKBACK_MIN)
+        b5_vwap_earlier = [b for b in b5_vwap if b.timestamp.astimezone(_ET) <= slope_cutoff]
+        vwap_earlier = _vwap(b5_vwap_earlier) if len(b5_vwap_earlier) >= 2 else None
+        slope_pct = ((stock.vwap - vwap_earlier) / vwap_earlier * 100
+                     if vwap_earlier and stock.vwap else None)
+
+        or_cutoff = market_open + timedelta(minutes=OPENING_RANGE_MINUTES)
+        or_bars = [b for b in b5_vwap if b.timestamp.astimezone(_ET) <= or_cutoff]
+        or_high = max((b.high for b in or_bars), default=None)
+        or_low = min((b.low for b in or_bars), default=None)
+        or_pct = (or_high - or_low) / or_low * 100 if or_bars and or_low else None
+
+        # ── Candidate filter: VWAP slope (off by default) ───────────────────
+        if VWAP_SLOPE_MIN_PCT != 0.0:
+            if slope_pct is None or slope_pct < VWAP_SLOPE_MIN_PCT:
+                continue
+
+        # ── Candidate filter: opening-range width (off by default) ─────────
+        if OPENING_RANGE_MAX_PCT > 0:
+            if or_pct is None or or_pct > OPENING_RANGE_MAX_PCT:
+                continue
 
         # ── Layer 2: SML2's own gates ──────────────────────────────────────
         if MAX_ENTRY_MOVE_PCT > 0 and stock.change_pct > MAX_ENTRY_MOVE_PCT:
@@ -265,6 +400,8 @@ def simulate_entry_rsi_macd(symbol: str, data: dict, d: date) -> dict | None:
             continue
         if REQUIRE_MACD_FRESH_CROSSOVER and not stock.macd_crossover:
             continue
+        if MACD_MIN_BARS_ABOVE_SIGNAL > 0 and stock.macd_bars_above_signal < MACD_MIN_BARS_ABOVE_SIGNAL:
+            continue
         rvol = _rvol_time_adjusted(b15_window, ts_et)
         if MIN_RVOL > 0 and (rvol is None or rvol < MIN_RVOL):
             continue
@@ -272,7 +409,9 @@ def simulate_entry_rsi_macd(symbol: str, data: dict, d: date) -> dict | None:
             continue
 
         return dict(entry_time=ts_et, entry_price=price, rsi=stock.rsi,
-                     change_pct=stock.change_pct, rvol=rvol, atr=stock.atr)
+                     change_pct=stock.change_pct, rvol=rvol, atr=stock.atr,
+                     vwap_slope_pct=round(slope_pct, 3) if slope_pct is not None else None,
+                     opening_range_pct=round(or_pct, 2) if or_pct is not None else None)
 
     return None
 
@@ -317,7 +456,7 @@ def simulate_entry_hod(symbol: str, data: dict, d: date) -> dict | None:
 
         # 3-calendar-day trailing window for RVOL
         b15_window = [b for b in bars15
-                      if (ts_et - timedelta(days=3)) <= b.timestamp.astimezone(_ET) <= ts_et]
+                      if _b15_start(ts_et) <= b.timestamp.astimezone(_ET) <= ts_et]
         rvol = _rvol_time_adjusted(b15_window, ts_et)
         if MIN_RVOL > 0 and (rvol is None or rvol < MIN_RVOL):
             continue
@@ -328,6 +467,89 @@ def simulate_entry_hod(symbol: str, data: dict, d: date) -> dict | None:
                      consol_range_pct=signal.consol_range_pct,
                      volume_ratio=signal.volume_ratio,
                      change_pct=signal.change_pct, rvol=rvol, atr=signal.atr)
+
+    return None
+
+
+def simulate_entry_vwap_reclaim(symbol: str, data: dict, d: date) -> dict | None:
+    """Candidate entry strategy from 2026-09-20 research (snappchart VWAP
+    playbook 'Setup 1: VWAP Reclaim'): price fades below the session VWAP,
+    holds below it for VWAP_RECLAIM_FADE_MIN consecutive 1-min closes (the
+    'consolidation'), then a reclaim bar closes back above VWAP on
+    >= VWAP_RECLAIM_VOL_MULT x the trailing consolidation's average volume.
+
+    Uses 1-min bars (bars1, already market-open-anchored) for both the VWAP
+    calc and the fade/reclaim detection, matching the granularity the real
+    setup is described at (vs. the 5-min bars rsi_macd/hod use).
+    """
+    bars1 = data["bars1"]
+    prev_close = data["prev_close"]
+    stop_buy = _ET.localize(datetime.combine(d, _parse_hm(STOP_BUY_TIME_ET)))
+    start_time = _ET.localize(datetime.combine(d, _parse_hm(START_TIME_ET)))
+
+    total_pv = 0.0
+    total_vol = 0.0
+    below_streak = 0
+
+    for i, bar in enumerate(bars1):
+        ts_et = bar.timestamp.astimezone(_ET)
+        if ts_et >= stop_buy:
+            break
+
+        tp = (bar.high + bar.low + bar.close) / 3.0
+        vwap_before = (total_pv / total_vol) if total_vol else None
+        total_pv += tp * bar.volume
+        total_vol += bar.volume
+        vwap_now = total_pv / total_vol if total_vol else None
+
+        if vwap_before is None or vwap_now is None or ts_et < start_time:
+            below_streak = 0
+            continue
+
+        reclaimed = bar.close >= vwap_before and below_streak >= VWAP_RECLAIM_FADE_MIN
+        if not reclaimed:
+            if bar.close < vwap_before:
+                below_streak += 1
+            else:
+                below_streak = 0
+            continue
+
+        consol_cutoff = ts_et - timedelta(minutes=VWAP_RECLAIM_CONSOL_LOOKBACK_MIN)
+        consol_bars = [b for b in bars1[:i] if b.timestamp.astimezone(_ET) >= consol_cutoff]
+        if not consol_bars:
+            below_streak = 0
+            continue
+        consol_avg_vol = sum(b.volume for b in consol_bars) / len(consol_bars)
+        volume_ratio = (bar.volume / consol_avg_vol) if consol_avg_vol else 0.0
+        if volume_ratio < VWAP_RECLAIM_VOL_MULT:
+            below_streak = 0
+            continue
+
+        price = bar.close
+        change_pct = round((price - prev_close) / prev_close * 100, 2) if prev_close else 0.0
+
+        # ── Layer 2 gates, kept consistent with the other strategies so
+        # results are comparable (not an unfair advantage/disadvantage) ─────
+        if MAX_ENTRY_MOVE_PCT > 0 and change_pct > MAX_ENTRY_MOVE_PCT:
+            below_streak = 0
+            continue
+        if MIN_CHANGE_PCT > 0 and change_pct < MIN_CHANGE_PCT:
+            below_streak = 0
+            continue
+
+        b15_window = [b for b in data["bars15"]
+                      if _b15_start(ts_et) <= b.timestamp.astimezone(_ET) <= ts_et]
+        rvol = _rvol_time_adjusted(b15_window, ts_et)
+        if MIN_RVOL > 0 and (rvol is None or rvol < MIN_RVOL):
+            below_streak = 0
+            continue
+        if MAX_RVOL > 0 and rvol and rvol > MAX_RVOL:
+            below_streak = 0
+            continue
+
+        return dict(entry_time=ts_et, entry_price=price, vwap=round(vwap_before, 4),
+                    fade_minutes=below_streak, volume_ratio=round(volume_ratio, 2),
+                    change_pct=change_pct, rvol=rvol, atr=None)
 
     return None
 
@@ -347,8 +569,21 @@ def simulate_exit(bars1: list, bars5: list, entry_time: datetime, entry_price: f
     atr_trail_active = False
     atr_pct = (entry_atr / entry_price * 100) if entry_atr else None
     tightened = False
-    hard_stop_price = entry_price * (1 - HARD_STOP_PCT / 100)
+    hard_stop_pct = HARD_STOP_PCT
+    if ATR_HARD_STOP and atr_pct:
+        hard_stop_pct = max(ATR_MIN_STOP_PCT, min(ATR_MAX_STOP_PCT, ATR_STOP_MULT * atr_pct))
+    hard_stop_price = entry_price * (1 - hard_stop_pct / 100)
     dump_t = _parse_hm(DUMP_TIME_ET)
+
+    # Session-anchored running VWAP per bar (bars1 starts at 09:30 ET), same
+    # typical-price formula as bot/market_data.py:vwap_reclaim_exit_price.
+    vwap_at: dict[int, float | None] = {}
+    total_pv = total_vol = 0.0
+    for b in bars1:
+        total_pv += (b.high + b.low + b.close) / 3.0 * b.volume
+        total_vol += b.volume
+        vwap_at[id(b)] = total_pv / total_vol if total_vol else None
+    reclaim_streak = 0
 
     post_entry = [b for b in bars1 if b.timestamp.astimezone(_ET) > entry_time]
 
@@ -366,11 +601,28 @@ def simulate_exit(bars1: list, bars5: list, entry_time: datetime, entry_price: f
             if trail_stop_price > stop_price:
                 stop_price = trail_stop_price
                 trail_binding = True
+        be_binding = False
+        if ATR_TRAIL_BE_FLOOR and atr_trail_active:
+            be_price = entry_price * (1 + ATR_TRAIL_BE_OFFSET_PCT / 100)
+            if be_price > stop_price:
+                stop_price, be_binding = be_price, True
         if bar.low <= stop_price:
-            reason = "Trailing stop" if trail_binding else "Hard stop"
-            gain = (stop_price - entry_price) / entry_price * 100
-            return dict(exit_time=ts_et, exit_price=stop_price, reason=reason,
+            reason = ("Breakeven floor" if be_binding
+                      else "Trailing stop" if trail_binding else "Hard stop")
+            # A bar that opens through the stop fills near the open, not at the stop.
+            fill = min(stop_price, bar.open) if REALISTIC_STOP_FILLS else stop_price
+            gain = (fill - entry_price) / entry_price * 100
+            return dict(exit_time=ts_et, exit_price=fill, reason=reason,
                         gain_pct=round(gain, 2), held_min=round(held_min))
+
+        # Pessimistic intrabar order: a bar that sets a new high and then
+        # sells off by the trail width inside the same minute stops out.
+        if REALISTIC_STOP_FILLS and trail_pct is not None and bar.high > high_water:
+            intrabar_stop = bar.high * (1 - trail_pct / 100)
+            if bar.low <= intrabar_stop and intrabar_stop > hard_stop_price:
+                gain = (intrabar_stop - entry_price) / entry_price * 100
+                return dict(exit_time=ts_et, exit_price=intrabar_stop, reason="Trailing stop",
+                            gain_pct=round(gain, 2), held_min=round(held_min))
 
         high_water = max(high_water, bar.high)
         price = bar.close
@@ -382,6 +634,18 @@ def simulate_exit(bars1: list, bars5: list, entry_time: datetime, entry_price: f
             atr_trail_active = True
             tightened = True  # supersedes the flat profit-lock tighten below
             trail_pct = ATR_TRAIL_MULT * atr_pct
+
+        # ── VWAP-reclaim exit — mirrors live monitor step 2 (runs before the
+        #    time checkpoints): N consecutive closes below both VWAP and entry.
+        if VWAP_RECLAIM_EXIT_DWELL > 0 and held_min >= VWAP_RECLAIM_EXIT_WARMUP:
+            vwap = vwap_at.get(id(bar))
+            if vwap is not None and price < vwap and price < entry_price:
+                reclaim_streak += 1
+                if reclaim_streak >= VWAP_RECLAIM_EXIT_DWELL:
+                    return dict(exit_time=ts_et, exit_price=price, reason="VWAP-reclaim exit",
+                                gain_pct=round(gain_pct, 2), held_min=round(held_min))
+            else:
+                reclaim_streak = 0
 
         if held_min >= MAX_HOLD_MINUTES:
             return dict(exit_time=ts_et, exit_price=price, reason="Max hold time exit",
@@ -400,7 +664,8 @@ def simulate_exit(bars1: list, bars5: list, entry_time: datetime, entry_price: f
         # ── RSI-overbought exit — mirrors run_sml2_screener.py's monitor
         #    step 5, using the same rolling-120min bars5 window. ───────────
         window_start = ts_et - timedelta(minutes=120)
-        b5_window = [b for b in bars5 if window_start <= b.timestamp.astimezone(_ET) <= ts_et]
+        b5_seen = _asof(bars5, 5, ts_et, bars1) if NO_LOOKAHEAD else bars5
+        b5_window = [b for b in b5_seen if window_start <= b.timestamp.astimezone(_ET) <= ts_et]
         if len(b5_window) >= 20:
             closes = [b.close for b in b5_window]
             rsi_vals = [r for r in _rsi_series(closes) if r is not None]
