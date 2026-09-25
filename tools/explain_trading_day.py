@@ -35,7 +35,7 @@ FILLED_RE = re.compile(r"^\d\d:\d\d:\d\d\s+INFO\s+FILLED\s+(\S+)\s+.*=\s*\$([\d.
 SOLD_RE  = re.compile(r"^\d\d:\d\d:\d\d\s+INFO\s+SOLD\s+(\S+)\s+@\s+\$([\d.]+)\s+PnL=\$([-+\d.]+)\s+\((.*)\)")
 CUTOFF_RE = re.compile(r"Past buy cutoff (\S+) ET")
 CAP_RE    = re.compile(r"Position cap reached \((\d+/\d+)\)")
-CASH_RE   = re.compile(r"Insufficient deployable cash: available=\$([\d.]+)\s+needed=\$([\d.]+)")
+CASH_RE   = re.compile(r"Insufficient (?:deployable )?cash:? (?:available=)?\$([\d.]+)(?: available,)?\s+(?:needed=)?\$([\d.]+)")
 ERROR_RE  = re.compile(r"^\d\d:\d\d:\d\d\s+ERROR\s+(.*)$")
 
 

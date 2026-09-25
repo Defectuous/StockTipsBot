@@ -140,6 +140,14 @@ Planned to go live in paper first per [memory: Live Trading Budget ($500)].
 
 ## Changelog
 
+- **2026-09-25** — SML/SML2: new `MIN_BUY_PCT_OF_SLOT` (default 50; `SML_`/`SML2_` overrides).
+  The pre-scan cash gate used to require a full slot (deployable / MAX_POSITIONS). Risk sizing
+  can make the first position bigger than a slot, which left the second slot unfundable. On
+  2026-09-24, after SDEV's $241 buy, $117 was available against the $179 required, and the bot
+  skipped every scan from 10:54 until the 11:45 cutoff. The gate now requires only 50% of a slot,
+  and each buy is capped to the cash available (logged as `CAP`). Also fixed the stale
+  `CASH_RE` in `tools/explain_trading_day.py` so cash shortfalls show up in reviews again.
+
 - **2026-08-04** — Archived MID and SUPER: moved `run_mid_screener.py`/`screener-mid.service` to
   `_archive/mid/` and `run_super_screener.py`/`screener-super.service` to `_archive/super/` (via
   `git mv`, history preserved). Neither has been actively tuned or reviewed since this project's

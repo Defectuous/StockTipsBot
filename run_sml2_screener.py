@@ -26,6 +26,9 @@ Config (env vars or .env):
   STARTING_BALANCE        initial wallet balance (first run only)  default: 500
   MAX_POSITIONS           max concurrent open positions            default: 2
   RESERVE_PCT             % of day-start balance held in reserve   default: 25
+  MIN_BUY_PCT_OF_SLOT     smallest buy allowed when cash is short, default: 50
+                          as % of one slot (deployable / MAX_POSITIONS).
+                          SML2_MIN_BUY_PCT_OF_SLOT overrides.
   TRAILING_STOP_PERCENT   trailing-stop distance %                 default: 10
   BUY_COOLDOWN_SECONDS    min seconds between buys/stock           default: 86400
   SCAN_INTERVAL_SECONDS   seconds between full scans               default: 60
@@ -157,6 +160,11 @@ SCREENER_ID      = os.getenv("SCREENER_ID",            "SML2")
 STARTING_BALANCE = float(os.getenv("STARTING_BALANCE", "500"))
 MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS",       "2"))
 RESERVE_PCT      = float(os.getenv("RESERVE_PCT",       "25"))
+# A risk-sized first position can take more than one slot (tight ATR stop ->
+# bigger position), leaving less than a full slot for the second. Buy whatever
+# is left as long as it's at least this % of a slot, instead of refusing to
+# scan at all until the first position closes.
+MIN_BUY_PCT_OF_SLOT = float(os.getenv("SML2_MIN_BUY_PCT_OF_SLOT") or os.getenv("MIN_BUY_PCT_OF_SLOT", "50"))
 TRAIL_PCT        = float(os.getenv("TRAILING_STOP_PERCENT",   "10"))
 COOLDOWN_SECS    = int(os.getenv("BUY_COOLDOWN_SECONDS",      "86400"))
 SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL_SECONDS",     "60"))
@@ -980,11 +988,15 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
         return
 
     buy_amount = _compute_buy_amount()
+    min_buy    = buy_amount * MIN_BUY_PCT_OF_SLOT / 100
     reserve    = wallet["day_start_balance"] * RESERVE_PCT / 100
     available  = wallet["current_balance"] - reserve
 
-    if available < buy_amount:
-        logger.info("[%s] Insufficient cash: $%.2f available, $%.2f needed", ts, available, buy_amount)
+    # Gate on the minimum usable buy, not a full slot: the per-candidate sizing
+    # below already caps each buy to what's available.
+    if available < min_buy:
+        logger.info("[%s] Insufficient cash: $%.2f available, $%.2f minimum (%.0f%% of $%.2f slot)",
+                    ts, available, min_buy, MIN_BUY_PCT_OF_SLOT, buy_amount)
         return
 
     # ── 1. Most active penny stocks ───────────────────────────────────────────
@@ -1147,7 +1159,14 @@ def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> No
         # (low-ATR) stock; take the largest position that still respects the
         # ATR stop distance instead of discarding a qualifying trade because
         # the risk-optimal size happened to be unaffordable.
-        sized_amount = min(sized_amount, available)
+        if sized_amount > available:
+            if available < min_buy:
+                logger.info("  SKIP  %s — depleted available cash (min $%.2f, have $%.2f)",
+                            sym, min_buy, available)
+                continue
+            logger.info("  CAP   %s — sized $%.2f capped to available $%.2f",
+                        sym, sized_amount, available)
+            sized_amount = available
         if sized_amount < stock.price:
             logger.info("  SKIP  %s — depleted available cash (need $%.2f, have $%.2f)",
                         sym, stock.price, available)
@@ -1278,9 +1297,9 @@ def main():
     logger.info("=" * 60)
     logger.info("SML2 screener starting  [%s]", SCREENER_ID)
     logger.info(
-        "Mode: %s | MaxPos: %d | Reserve: %.0f%% | Stop: %.0f%% | "
+        "Mode: %s | MaxPos: %d | Reserve: %.0f%% | MinBuy: %.0f%% of slot | Stop: %.0f%% | "
         "Lock: +%.0f%%->%.0f%% | RSI exit: %.0f",
-        mode, MAX_POSITIONS, RESERVE_PCT, TRAIL_PCT,
+        mode, MAX_POSITIONS, RESERVE_PCT, MIN_BUY_PCT_OF_SLOT, TRAIL_PCT,
         PROFIT_LOCK_PCT, TIGHT_STOP_PCT, RSI_EXIT_LEVEL,
     )
     logger.info(
